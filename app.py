@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 fixed-party-legend"
+APP_VERSION = "2026-05-06 hardcoded-scale-ticks"
 
 STATE_CONFIG = {
     "California": {
@@ -1424,7 +1424,7 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     if layer_column in {"dem_share", "rep_share"}:
         tick_labels = [0, 0.5, 1]
     elif layer_column in {"turnout_rate", "young_voter_turnout"}:
-        tick_labels = [round(vmin, 3), round((vmin + vmax) / 2, 3), round(vmax, 3)]
+        tick_labels = [0, 0.5, 1]
     elif layer_column in PERCENT_COLUMNS:
         tick_labels = [0, 0.5, 1]
     else:
@@ -1658,6 +1658,69 @@ def party_vote_volume_legend_html() -> str:
     """
 
 
+def fixed_decimal_legend_html(title: str, color_map: cm.LinearColormap) -> str:
+    """Create a fixed 0.0, 0.5, 1.0 legend without changing map colors."""
+    sample_values = np.linspace(float(color_map.vmin), float(color_map.vmax), 16)
+    stops = []
+    for index, value in enumerate(sample_values):
+        position = round(index * 100 / (len(sample_values) - 1), 2)
+        stops.append(f"{color_map.rgb_hex_str(float(value))} {position}%")
+    gradient = ", ".join(stops)
+
+    return f"""
+    <style>
+    .fixed-decimal-legend {{
+        position: fixed !important;
+        top: 14px !important;
+        right: 14px !important;
+        z-index: 999999 !important;
+        background: rgba(15, 23, 42, 0.92) !important;
+        color: #f8fafc !important;
+        border: 1px solid rgba(148, 163, 184, 0.45) !important;
+        border-radius: 6px !important;
+        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35) !important;
+        padding: 9px 12px 10px 12px !important;
+        width: 360px !important;
+        pointer-events: none !important;
+    }}
+    .fixed-decimal-ticks {{
+        display: flex;
+        justify-content: space-between;
+        color: #f8fafc;
+        font-weight: 700;
+        line-height: 1.1;
+        margin-bottom: 3px;
+    }}
+    .fixed-decimal-bar {{
+        height: 30px;
+        border-radius: 1px;
+        background: linear-gradient(90deg, {gradient});
+    }}
+    .fixed-decimal-title {{
+        color: #f8fafc;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+        margin-top: 7px;
+        white-space: nowrap;
+    }}
+    @media (max-width: 700px) {{
+        .fixed-decimal-legend {{
+            width: 280px !important;
+            right: 8px !important;
+        }}
+    }}
+    </style>
+    <div class="fixed-decimal-legend leaflet-control">
+        <div class="fixed-decimal-ticks">
+            <span>0.0</span><span>0.5</span><span>1.0</span>
+        </div>
+        <div class="fixed-decimal-bar"></div>
+        <div class="fixed-decimal-title">{title}</div>
+    </div>
+    """
+
+
 def legend_title(layer_column: str | None) -> str:
     """Return the short title shown below the legend scale."""
     if layer_column == "dem_share":
@@ -1721,7 +1784,7 @@ def legend_formatter_script(layer_column: str | None) -> str:
                     return;
                 }}
                 if ("{mode}" === "percent") {{
-                    label.textContent = Math.round(value * 100) + "%";
+                    label.textContent = value.toFixed(1);
                 }} else if ("{mode}" === "votes") {{
                     label.textContent = value >= 1000000
                         ? (value / 1000000).toFixed(1) + "M"
@@ -2063,10 +2126,15 @@ def create_folium_map(
                 "opacity": 0.85,
             }
 
-        color_map.add_to(map_object)
-        formatter = legend_formatter_script(layer_column)
-        if formatter:
-            map_object.get_root().html.add_child(folium.Element(formatter))
+        if layer_column in PERCENT_COLUMNS:
+            map_object.get_root().html.add_child(
+                folium.Element(fixed_decimal_legend_html(legend_title(layer_column), color_map))
+            )
+        else:
+            color_map.add_to(map_object)
+            formatter = legend_formatter_script(layer_column)
+            if formatter:
+                map_object.get_root().html.add_child(folium.Element(formatter))
     else:
         style_function = lambda _: {
             "fillColor": "#334155",
