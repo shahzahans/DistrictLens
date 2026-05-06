@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 legend-title-css-after"
+APP_VERSION = "2026-05-06 turnout-contrast-scale"
 
 STATE_CONFIG = {
     "California": {
@@ -99,13 +99,13 @@ LAYER_DEFINITIONS = [
         "category": "Turnout",
         "label": "Overall turnout",
         "column": "turnout_rate",
-        "description": "Votes divided by registered voters when those fields are available.",
+        "description": "Votes divided by registered voters. Light green is lower turnout; dark green is higher turnout.",
     },
     {
         "category": "Turnout",
         "label": "Young turnout",
         "column": "young_voter_turnout",
-        "description": "Estimated turnout for young voter age groups, usually 18-24, when L2 age fields are detected.",
+        "description": "Estimated young voter turnout. Light purple is lower; dark purple is higher.",
     },
     {
         "category": "CVAP demographics",
@@ -1404,6 +1404,13 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
         vmin, vmax = 0, 1
     elif layer_column in {"dem_share", "rep_share"}:
         vmin, vmax = 0, 1
+    elif layer_column in {"turnout_rate", "young_voter_turnout"}:
+        vmin = max(0, float(numeric.quantile(0.05)))
+        vmax = min(1, float(numeric.quantile(0.95)))
+        if vmin == vmax:
+            spread = 0.05 if vmin == 0 else max(0.02, abs(vmin) * 0.08)
+            vmin = max(0, vmin - spread)
+            vmax = min(1, vmax + spread)
     elif layer_column in PERCENT_COLUMNS:
         vmin, vmax = 0, 1
     else:
@@ -1416,6 +1423,8 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
 
     if layer_column in {"dem_share", "rep_share"}:
         tick_labels = [0, 0.5, 1]
+    elif layer_column in {"turnout_rate", "young_voter_turnout"}:
+        tick_labels = [round(vmin, 3), round((vmin + vmax) / 2, 3), round(vmax, 3)]
     elif layer_column in PERCENT_COLUMNS:
         tick_labels = [0, 0.5, 1]
     else:
@@ -1452,7 +1461,7 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
         )
     elif layer_column == "turnout_rate":
         color_map = cm.LinearColormap(
-            ["#f7fcf5", "#c7e9c0", "#41ab5d", "#005a32"],
+            ["#f7fcf5", "#c7e9c0", "#41ab5d", "#00441b"],
             vmin=vmin,
             vmax=vmax,
             tick_labels=tick_labels,
@@ -1470,7 +1479,7 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
         )
     elif layer_column == "young_voter_turnout":
         color_map = cm.LinearColormap(
-            ["#ffffcc", "#a1dab4", "#41b6c4", "#225ea8"],
+            ["#f7f4f9", "#cbc9e2", "#807dba", "#3f007d"],
             vmin=vmin,
             vmax=vmax,
             tick_labels=tick_labels,
@@ -2106,11 +2115,11 @@ def map_status_text(state_name: str, geography: str, layer_label: str, layer_col
     if layer_column == "total_dr_votes":
         return f"{base} Darker colors mean more Democratic plus Republican votes. Hover or click for exact vote totals."
     if layer_column == "turnout_rate":
-        return f"{base} Darker green means higher turnout. Hover or click for the turnout percentage."
+        return f"{base} Darker green means higher turnout within this state. Hover or click for the turnout percentage."
     if layer_column and "cvap" in layer_column:
         return f"{base} Darker purple means a higher {layer_label} share. Hover or click for exact CVAP percentages."
     if layer_column == "young_voter_turnout":
-        return f"{base} Darker blue-green means higher young voter turnout. Hover or click for exact percentages."
+        return f"{base} Darker purple means higher young voter turnout within this state. Hover or click for exact percentages."
     return f"{base} Hover or click a district for available statistics."
 
 
