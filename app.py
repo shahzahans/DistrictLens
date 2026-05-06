@@ -30,6 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
+DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 
 STATE_CONFIG = {
@@ -582,6 +583,29 @@ def district_cache_paths(state_name: str) -> tuple[Path, Path]:
     return CACHE_DIR / f"{abbr}_districts_fast.geojson", CACHE_DIR / f"{abbr}_districts_fast_meta.json"
 
 
+def deploy_district_path(state_name: str) -> Path:
+    """Return the small congressional district file committed for Streamlit Cloud."""
+    abbr = STATE_CONFIG[state_name]["abbr"]
+    return DEPLOY_DATA_DIR / f"{abbr}_districts_fast.geojson"
+
+
+def state_source_zip_paths(state_name: str) -> list[Path]:
+    """Return the source ZIP paths expected for a state."""
+    config = STATE_CONFIG[state_name]
+    state_folder = DATA_DIR / config["folder"]
+    return [
+        state_folder / config["district_zip"],
+        state_folder / config["precinct_zip"],
+        state_folder / config["cvap_zip"],
+        state_folder / config["l2_zip"],
+    ]
+
+
+def has_state_source_data(state_name: str) -> bool:
+    """True when the local/raw ZIP data is available for a state."""
+    return any(path.exists() for path in state_source_zip_paths(state_name))
+
+
 def load_district_cache(
     state_name: str,
     signature: str,
@@ -607,6 +631,25 @@ def load_district_cache(
         return None
 
     return ensure_wgs84(gdf, f"{state_name} fast district cache", warnings)
+
+
+def load_deploy_district_data(state_name: str, warnings: list[str]) -> gpd.GeoDataFrame | None:
+    """Load the compact district dataset used by Streamlit Cloud deployments."""
+    path = deploy_district_path(state_name)
+    if not path.exists():
+        return None
+
+    try:
+        gdf = gpd.read_file(path, engine="pyogrio")
+    except Exception as exc:
+        warnings.append(f"Could not load deploy-ready district data for {state_name}: {exc}")
+        return None
+
+    warnings.append(
+        f"{state_name}: using compact deploy-ready congressional district data. "
+        "Full precinct/source ZIP layers are only available when the local data folder is present."
+    )
+    return ensure_wgs84(gdf, f"{state_name} deploy-ready district data", warnings)
 
 
 def write_district_cache(state_name: str, signature: str, district_gdf: gpd.GeoDataFrame | None) -> None:
@@ -1175,15 +1218,10 @@ def load_state_data(
     state_folder = DATA_DIR / config["folder"]
     warnings: list[str] = []
     debug: dict[str, Any] = {"state": state_name, "files": {}, "detected_columns": {}}
+    source_zip_paths = state_source_zip_paths(state_name)
+    source_data_available = any(path.exists() for path in source_zip_paths)
 
-    signature = source_signature(
-        [
-            state_folder / config["district_zip"],
-            state_folder / config["precinct_zip"],
-            state_folder / config["cvap_zip"],
-            state_folder / config["l2_zip"],
-        ]
-    )
+    signature = source_signature(source_zip_paths)
     debug["source_signature"] = signature
     if geography == "Congressional Districts":
         cached_districts = load_district_cache(state_name, signature, warnings)
@@ -1203,6 +1241,29 @@ def load_state_data(
             }
         if cached_districts is not None and load_precinct_elections and not cache_has_elections:
             debug["cache"] = "ignored cache because it does not include precinct election vote-share columns"
+
+    if not source_data_available:
+        deploy_districts = load_deploy_district_data(state_name, warnings)
+        if deploy_districts is not None:
+            debug["mode"] = "deploy-ready compact data"
+            debug["files"] = {
+                "deploy_districts": str(deploy_district_path(state_name)),
+                "local_source_data": "not found",
+            }
+            debug["detected_columns"]["district_boundaries"] = detect_columns(
+                deploy_districts.drop(columns="geometry", errors="ignore")
+            )
+            if geography == "Precincts":
+                warnings.append(
+                    "Precinct view needs the full local source ZIP files and is not available in this deployed version."
+                )
+            return {
+                "districts": deploy_districts,
+                "precincts": None,
+                "precinct_attributes": None,
+                "warnings": warnings,
+                "debug": debug,
+            }
 
     required_zips = [config["district_zip"]]
     if geography == "Precincts":
@@ -1846,7 +1907,11 @@ def main() -> None:
         st.header("Map Controls")
         st.markdown("### 1. Place")
         state_name = st.selectbox("State", list(STATE_CONFIG.keys()))
-        geography = st.selectbox("Geography", ["Congressional Districts", "Precincts"])
+        source_data_available = has_state_source_data(state_name)
+        geography_options = ["Congressional Districts", "Precincts"] if source_data_available else ["Congressional Districts"]
+        geography = st.selectbox("Geography", geography_options)
+        if not source_data_available:
+            st.caption("Deployment mode: compact congressional district data is available; precinct ZIP files are not bundled.")
 
         st.markdown("### 2. Data Loading")
         max_precinct_features = MAX_MAP_FEATURES

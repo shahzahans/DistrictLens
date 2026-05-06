@@ -23,11 +23,14 @@ CA-LA Model/
 │       ├── la_cvap_2023_b.zip
 │       └── LA_l2_2024_gen_stats_2020block.zip
 ├── outputs/
+├── deploy_data/
 ├── README.md
 └── requirements.txt
 ```
 
 The app automatically extracts each ZIP into a generated folder next to the ZIP file. You do not need to unzip the data manually.
+
+`deploy_data/` contains compact congressional district GeoJSON files for Streamlit Community Cloud. These files let the public app run without uploading the very large raw ZIP files.
 
 ## Install
 
@@ -48,6 +51,18 @@ streamlit run app.py
 ```
 
 The dashboard opens in your browser. Use the sidebar to choose a state, geography, map layer, district overlay, city markers, and simplified geometry.
+
+## Deploy
+
+This repo is ready for Streamlit Community Cloud:
+
+```text
+Repository: shahzahans/DistrictLens
+Branch: main
+Main file path: app.py
+```
+
+The public deployed app uses `deploy_data/` by default because the full `data/` folder is intentionally not committed to GitHub. The deployed version supports congressional district maps and summary layers. Full precinct views require the local ZIP files listed above.
 
 ## Performance Tips
 
