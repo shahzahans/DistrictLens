@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 legend-title-below-scale"
+APP_VERSION = "2026-05-06 legend-title-under-html"
 
 STATE_CONFIG = {
     "California": {
@@ -1487,19 +1487,25 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
             text_color="#f8fafc",
         )
 
-    if layer_column == "dem_share":
-        color_map.caption = "Partisan result"
-    elif layer_column == "rep_share":
-        color_map.caption = "Republican share"
-    elif layer_column == "turnout_rate":
-        color_map.caption = "Overall turnout"
-    elif layer_column == "total_dr_votes":
-        color_map.caption = "D + R votes"
-    else:
-        color_map.caption = LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
+    color_map.caption = ""
     color_map.width = 360
-    color_map.height = 84
+    color_map.height = 56
     return color_map
+
+
+def legend_title(layer_column: str | None) -> str:
+    """Return the short title shown below the legend scale."""
+    if layer_column == "dem_share":
+        return "Partisan result"
+    if layer_column == "rep_share":
+        return "Republican share"
+    if layer_column == "turnout_rate":
+        return "Overall turnout"
+    if layer_column == "total_dr_votes":
+        return "D + R votes"
+    if layer_column:
+        return LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
+    return "Scale"
 
 
 def legend_formatter_script(layer_column: str | None) -> str:
@@ -1510,21 +1516,34 @@ def legend_formatter_script(layer_column: str | None) -> str:
         mode = "votes"
     else:
         mode = ""
+    title = json.dumps(legend_title(layer_column))
 
     return f"""
     <script>
     (function() {{
+        var legendTitle = {title};
         function formatLegend() {{
-            document.querySelectorAll(".legend svg").forEach(function(svg) {{
-                svg.setAttribute("height", "84");
+            var legend = document.querySelector(".legend.leaflet-control");
+            if (!legend) {{
+                return;
+            }}
+            legend.querySelectorAll("svg").forEach(function(svg) {{
+                svg.setAttribute("height", "56");
             }});
             document.querySelectorAll(".legend rect").forEach(function(rect) {{
                 rect.setAttribute("height", "30");
             }});
             document.querySelectorAll(".legend .caption").forEach(function(caption) {{
-                caption.setAttribute("x", "0");
-                caption.setAttribute("y", "52");
+                caption.textContent = "";
+                caption.style.display = "none";
             }});
+            var title = legend.querySelector(".legend-title-under");
+            if (!title) {{
+                title = document.createElement("div");
+                title.className = "legend-title-under";
+                legend.appendChild(title);
+            }}
+            title.textContent = legendTitle;
             document.querySelectorAll(".legend .tick text").forEach(function(label) {{
                 var raw = label.textContent.replace(/,/g, "").trim();
                 var value = Number(raw);
@@ -1540,9 +1559,14 @@ def legend_formatter_script(layer_column: str | None) -> str:
                 }}
             }});
         }}
+        if (document.body) {{
+            var observer = new MutationObserver(formatLegend);
+            observer.observe(document.body, {{childList: true, subtree: true}});
+        }}
         setTimeout(formatLegend, 250);
         setTimeout(formatLegend, 900);
         setTimeout(formatLegend, 1600);
+        setTimeout(formatLegend, 2600);
     }})();
     </script>
     """
@@ -1762,8 +1786,16 @@ def create_folium_map(
             overflow: visible !important;
         }
         .legend .caption {
+            display: none !important;
+        }
+        .legend-title-under {
+            color: #f8fafc !important;
             font-size: 13px !important;
             font-weight: 700 !important;
+            line-height: 1.2 !important;
+            margin: -2px 0 2px 25px !important;
+            max-width: 340px !important;
+            white-space: nowrap !important;
         }
         .legend text,
         .legend span,
