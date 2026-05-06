@@ -1405,12 +1405,7 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     elif layer_column in {"dem_share", "rep_share"}:
         vmin, vmax = 0, 1
     elif layer_column in PERCENT_COLUMNS:
-        vmin = max(0, float(numeric.quantile(0.05)))
-        vmax = min(1, float(numeric.quantile(0.95)))
-        if vmin == vmax:
-            spread = 0.05 if vmin == 0 else max(0.02, abs(vmin) * 0.08)
-            vmin = max(0, vmin - spread)
-            vmax = min(1, vmax + spread)
+        vmin, vmax = 0, 1
     else:
         vmin = float(numeric.quantile(0.02))
         vmax = float(numeric.quantile(0.98))
@@ -1422,7 +1417,7 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     if layer_column in {"dem_share", "rep_share"}:
         tick_labels = [0, 0.5, 1]
     elif layer_column in PERCENT_COLUMNS:
-        tick_labels = [round(vmin, 2), round((vmin + vmax) / 2, 2), round(vmax, 2)]
+        tick_labels = [0, 0.5, 1]
     else:
         tick_labels = [round(vmin), round((vmin + vmax) / 2), round(vmax)]
 
@@ -1493,17 +1488,17 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
         )
 
     if layer_column == "dem_share":
-        color_map.caption = "Partisan result: darker blue = more Democratic, darker red = more Republican"
+        color_map.caption = "Partisan result"
     elif layer_column == "rep_share":
-        color_map.caption = "Republican share: darker red = higher Republican vote share"
+        color_map.caption = "Republican share"
     elif layer_column == "turnout_rate":
-        color_map.caption = "Overall turnout: darker green = higher turnout"
+        color_map.caption = "Overall turnout"
     elif layer_column == "total_dr_votes":
-        color_map.caption = "D + R votes: darker color = more Democratic + Republican votes"
+        color_map.caption = "D + R votes"
     else:
         color_map.caption = LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
     color_map.width = 360
-    color_map.height = 74
+    color_map.height = 64
     return color_map
 
 
@@ -1753,6 +1748,14 @@ def create_folium_map(
             border-radius: 6px !important;
             box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35) !important;
             padding: 8px !important;
+        }
+        .legend svg {
+            max-width: 390px !important;
+            overflow: visible !important;
+        }
+        .legend .caption {
+            font-size: 13px !important;
+            font-weight: 700 !important;
         }
         .legend text,
         .legend span,
