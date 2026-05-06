@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 legend-title-under-html"
+APP_VERSION = "2026-05-06 legend-title-css-after"
 
 STATE_CONFIG = {
     "California": {
@@ -1519,9 +1519,21 @@ def legend_formatter_script(layer_column: str | None) -> str:
     title = json.dumps(legend_title(layer_column))
 
     return f"""
+    <style>
+    .legend.leaflet-control::after {{
+        content: {title};
+        display: block;
+        color: #f8fafc;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+        margin: -2px 0 2px 25px;
+        max-width: 340px;
+        white-space: nowrap;
+    }}
+    </style>
     <script>
     (function() {{
-        var legendTitle = {title};
         function formatLegend() {{
             var legend = document.querySelector(".legend.leaflet-control");
             if (!legend) {{
@@ -1537,13 +1549,6 @@ def legend_formatter_script(layer_column: str | None) -> str:
                 caption.textContent = "";
                 caption.style.display = "none";
             }});
-            var title = legend.querySelector(".legend-title-under");
-            if (!title) {{
-                title = document.createElement("div");
-                title.className = "legend-title-under";
-                legend.appendChild(title);
-            }}
-            title.textContent = legendTitle;
             document.querySelectorAll(".legend .tick text").forEach(function(label) {{
                 var raw = label.textContent.replace(/,/g, "").trim();
                 var value = Number(raw);
