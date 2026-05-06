@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 vote-scale fix"
+APP_VERSION = "2026-05-06 legend-title-below-scale"
 
 STATE_CONFIG = {
     "California": {
@@ -1498,25 +1498,33 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     else:
         color_map.caption = LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
     color_map.width = 360
-    color_map.height = 64
+    color_map.height = 84
     return color_map
 
 
 def legend_formatter_script(layer_column: str | None) -> str:
-    """Format Folium legend tick labels so they are readable in the browser."""
+    """Format Folium legends so tick labels are readable and captions sit below the scale."""
     if layer_column in PERCENT_COLUMNS:
         mode = "percent"
     elif layer_column == "total_dr_votes":
         mode = "votes"
     else:
         mode = ""
-    if not mode:
-        return ""
 
     return f"""
     <script>
     (function() {{
-        function formatLegendTicks() {{
+        function formatLegend() {{
+            document.querySelectorAll(".legend svg").forEach(function(svg) {{
+                svg.setAttribute("height", "84");
+            }});
+            document.querySelectorAll(".legend rect").forEach(function(rect) {{
+                rect.setAttribute("height", "30");
+            }});
+            document.querySelectorAll(".legend .caption").forEach(function(caption) {{
+                caption.setAttribute("x", "0");
+                caption.setAttribute("y", "52");
+            }});
             document.querySelectorAll(".legend .tick text").forEach(function(label) {{
                 var raw = label.textContent.replace(/,/g, "").trim();
                 var value = Number(raw);
@@ -1532,9 +1540,9 @@ def legend_formatter_script(layer_column: str | None) -> str:
                 }}
             }});
         }}
-        setTimeout(formatLegendTicks, 250);
-        setTimeout(formatLegendTicks, 900);
-        setTimeout(formatLegendTicks, 1600);
+        setTimeout(formatLegend, 250);
+        setTimeout(formatLegend, 900);
+        setTimeout(formatLegend, 1600);
     }})();
     </script>
     """
