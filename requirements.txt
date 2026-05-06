@@ -1,0 +1,10 @@
+streamlit>=1.36
+geopandas>=0.14
+pandas>=2.0
+folium>=0.16
+streamlit-folium>=0.20
+branca>=0.7
+shapely>=2.0
+pyogrio>=0.8
+numpy>=1.26
+mapclassify>=2.6
