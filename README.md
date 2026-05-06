@@ -96,7 +96,7 @@ The sidebar groups available map layers into clearer categories. A category only
 
 ### Votes
 
-- Party winner strength: blue districts voted more Democratic, red districts voted more Republican, and darker color means the winner was farther above 50%. Hover over a district for exact votes and percentages.
+- Party winner: blue districts had more Democratic votes and red districts had more Republican votes. In California, darker blue means more Democratic votes and darker red means more Republican votes. Louisiana keeps the stronger-winner shading used in the deployed map.
 - D + R votes: Democratic plus Republican votes.
 
 ### Turnout

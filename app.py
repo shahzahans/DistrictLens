@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 party-winner-strength"
+APP_VERSION = "2026-05-06 california-party-vote-shading"
 
 STATE_CONFIG = {
     "California": {
@@ -79,9 +79,9 @@ STATE_CONFIG = {
 LAYER_DEFINITIONS = [
     {
         "category": "Votes",
-        "label": "Party winner strength",
+        "label": "Party winner",
         "column": "dem_share",
-        "description": "Blue means Democratic winner and red means Republican winner. Darker color means a stronger win above 50%.",
+        "description": "Blue means Democratic winner and red means Republican winner. California uses darker color for more party votes; Louisiana uses darker color for stronger wins.",
     },
     {
         "category": "Votes",
@@ -1514,6 +1514,57 @@ def interpolate_hex_color(light_hex: str, dark_hex: str, amount: float) -> str:
     return "#" + "".join(f"{channel:02x}" for channel in blended)
 
 
+def practical_value_bounds(values: pd.Series) -> tuple[float, float]:
+    """Find a useful low/high range for light-to-dark shading."""
+    numeric = safe_numeric(values).replace([np.inf, -np.inf], np.nan).dropna()
+    if numeric.empty:
+        return 0.0, 1.0
+
+    if len(numeric) <= 20:
+        vmin = float(numeric.min())
+        vmax = float(numeric.max())
+    else:
+        vmin = float(numeric.quantile(0.05))
+        vmax = float(numeric.quantile(0.95))
+
+    if vmin == vmax:
+        spread = max(1.0, abs(vmin) * 0.08)
+        vmin -= spread
+        vmax += spread
+    return vmin, vmax
+
+
+def party_vote_count_bounds(gdf: pd.DataFrame) -> dict[str, tuple[float, float]]:
+    """Find separate vote-count ranges for Democratic-won and Republican-won areas."""
+    dem_votes = safe_numeric(gdf.get("dem_votes", pd.Series(dtype="float64")))
+    rep_votes = safe_numeric(gdf.get("rep_votes", pd.Series(dtype="float64")))
+    valid = dem_votes.notna() & rep_votes.notna()
+    dem_winner_votes = dem_votes[valid & (dem_votes >= rep_votes)]
+    rep_winner_votes = rep_votes[valid & (rep_votes > dem_votes)]
+    return {
+        "dem": practical_value_bounds(dem_winner_votes if not dem_winner_votes.empty else dem_votes),
+        "rep": practical_value_bounds(rep_winner_votes if not rep_winner_votes.empty else rep_votes),
+    }
+
+
+def party_vote_count_color(properties: dict[str, Any], vote_bounds: dict[str, tuple[float, float]]) -> str:
+    """Color by party winner, then shade by raw Democratic or Republican votes."""
+    dem_votes = pd.to_numeric(properties.get("dem_votes"), errors="coerce")
+    rep_votes = pd.to_numeric(properties.get("rep_votes"), errors="coerce")
+
+    if pd.isna(dem_votes) or pd.isna(rep_votes):
+        return party_winner_strength_color(properties)
+
+    if dem_votes >= rep_votes:
+        vmin, vmax = vote_bounds.get("dem", (0.0, 1.0))
+        volume = 0.5 if vmax == vmin else clamp_unit_interval((float(dem_votes) - vmin) / (vmax - vmin))
+        return interpolate_hex_color("#c7e9ff", "#0050a4", volume)
+
+    vmin, vmax = vote_bounds.get("rep", (0.0, 1.0))
+    volume = 0.5 if vmax == vmin else clamp_unit_interval((float(rep_votes) - vmin) / (vmax - vmin))
+    return interpolate_hex_color("#f8c7c2", "#99000d", volume)
+
+
 def party_winner_strength_color(properties: dict[str, Any]) -> str:
     """Color by party winner, then shade by how far the winner is above 50%."""
     dem_share = pd.to_numeric(properties.get("dem_share"), errors="coerce")
@@ -1530,8 +1581,8 @@ def party_winner_strength_color(properties: dict[str, Any]) -> str:
     return interpolate_hex_color("#f8c7c2", "#99000d", strength)
 
 
-def party_winner_strength_legend_html() -> str:
-    """Create a fixed legend for the party-winner-strength layer."""
+def party_winner_legend_html(title: str) -> str:
+    """Create a fixed red/blue legend for the party winner layer."""
     return """
     <style>
     .party-volume-legend {
@@ -1602,7 +1653,7 @@ def party_winner_strength_legend_html() -> str:
         <div class="party-volume-row">
             <span>R</span><div class="party-volume-bar party-volume-rep"></div>
         </div>
-        <div class="party-volume-title">Party winner strength</div>
+        <div class="party-volume-title">""" + title + """</div>
     </div>
     """
 
@@ -1673,7 +1724,7 @@ def fixed_decimal_legend_html(title: str, color_map: cm.LinearColormap) -> str:
 def legend_title(layer_column: str | None) -> str:
     """Return the short title shown below the legend scale."""
     if layer_column == "dem_share":
-        return "Party winner strength"
+        return "Party winner"
     if layer_column == "rep_share":
         return "Republican share"
     if layer_column == "turnout_rate":
@@ -1768,7 +1819,7 @@ def prepare_map_gdf(
     if layer_column and layer_column in gdf.columns:
         keep_columns.append(layer_column)
     if layer_column == "dem_share":
-        for related_column in ("rep_share", "total_dr_votes"):
+        for related_column in ("rep_share", "dem_votes", "rep_votes", "total_dr_votes"):
             if related_column in gdf.columns:
                 keep_columns.append(related_column)
     keep_columns = list(dict.fromkeys(keep_columns))
@@ -2042,17 +2093,30 @@ def create_folium_map(
         layer_column == "dem_share"
         and {"dem_share", "rep_share"}.issubset(map_gdf.columns)
     ):
+        use_party_vote_counts = (
+            state_name == "California"
+            and {"dem_votes", "rep_votes"}.issubset(map_gdf.columns)
+            and has_usable_numeric_data(map_gdf, "dem_votes")
+            and has_usable_numeric_data(map_gdf, "rep_votes")
+        )
+        party_vote_bounds = party_vote_count_bounds(map_gdf) if use_party_vote_counts else None
+
         def style_function(feature: dict[str, Any]) -> dict[str, Any]:
+            if use_party_vote_counts and party_vote_bounds is not None:
+                fill_color = party_vote_count_color(feature["properties"], party_vote_bounds)
+            else:
+                fill_color = party_winner_strength_color(feature["properties"])
             return {
-                "fillColor": party_winner_strength_color(feature["properties"]),
+                "fillColor": fill_color,
                 "color": "#f8fafc",
                 "weight": 0.65,
                 "fillOpacity": 0.9,
                 "opacity": 0.85,
             }
 
+        legend_text = "Party vote volume" if use_party_vote_counts else "Party winner strength"
         map_object.get_root().html.add_child(
-            folium.Element(party_winner_strength_legend_html())
+            folium.Element(party_winner_legend_html(legend_text))
         )
     elif layer_column and layer_column in map_gdf.columns:
         color_map = layer_colormap(layer_column, map_gdf[layer_column])
@@ -2299,6 +2363,12 @@ def map_status_text(state_name: str, geography: str, layer_label: str, layer_col
     """Write a plain-language sentence above the map."""
     base = f"Showing {state_name} {geography.lower()}."
     if layer_column == "dem_share":
+        if state_name == "California":
+            return (
+                f"{base} Blue districts had more Democratic votes and red districts had more "
+                "Republican votes. Darker blue means more Democratic votes; darker red means "
+                "more Republican votes. Hover or click for exact votes and percentages."
+            )
         return (
             f"{base} Blue districts voted more Democratic and red districts voted more Republican. "
             "Darker color means a stronger win above 50%. Hover or click for exact votes and percentages."
