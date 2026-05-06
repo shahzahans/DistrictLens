@@ -32,6 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
+APP_VERSION = "2026-05-06 vote-scale fix"
 
 STATE_CONFIG = {
     "California": {
@@ -1212,8 +1213,10 @@ def load_state_data(
     geography: str = "Congressional Districts",
     max_precinct_features: int = MAX_MAP_FEATURES,
     load_precinct_elections: bool = True,
+    app_version: str = APP_VERSION,
 ) -> dict[str, Any]:
     """Load and process all data for one selected state."""
+    del app_version
     config = STATE_CONFIG[state_name]
     state_folder = DATA_DIR / config["folder"]
     warnings: list[str] = []
@@ -1399,13 +1402,29 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     numeric = safe_numeric(values).replace([np.inf, -np.inf], np.nan).dropna()
     if numeric.empty:
         vmin, vmax = 0, 1
-    elif layer_column in PERCENT_COLUMNS:
+    elif layer_column in {"dem_share", "rep_share"}:
         vmin, vmax = 0, 1
+    elif layer_column in PERCENT_COLUMNS:
+        vmin = max(0, float(numeric.quantile(0.05)))
+        vmax = min(1, float(numeric.quantile(0.95)))
+        if vmin == vmax:
+            spread = 0.05 if vmin == 0 else max(0.02, abs(vmin) * 0.08)
+            vmin = max(0, vmin - spread)
+            vmax = min(1, vmax + spread)
     else:
         vmin = float(numeric.quantile(0.02))
         vmax = float(numeric.quantile(0.98))
         if vmin == vmax:
             vmin, vmax = float(numeric.min()), float(numeric.max() or 1)
+    if vmin == vmax:
+        vmax = vmin + 1
+
+    if layer_column in {"dem_share", "rep_share"}:
+        tick_labels = [0, 0.5, 1]
+    elif layer_column in PERCENT_COLUMNS:
+        tick_labels = [round(vmin, 2), round((vmin + vmax) / 2, 2), round(vmax, 2)]
+    else:
+        tick_labels = [round(vmin), round((vmin + vmax) / 2), round(vmax)]
 
     if layer_column == "dem_share":
         color_map = cm.LinearColormap(
@@ -1413,6 +1432,9 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
             index=[0, 0.4, 0.5, 0.6, 1],
             vmin=0,
             vmax=1,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
         )
     elif layer_column == "rep_share":
         color_map = cm.LinearColormap(
@@ -1420,25 +1442,107 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
             index=[0, 0.4, 0.5, 0.6, 1],
             vmin=0,
             vmax=1,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
         )
     elif layer_column == "total_dr_votes":
-        color_map = cm.linear.YlOrRd_09.scale(vmin, vmax)
+        color_map = cm.LinearColormap(
+            ["#fff7bc", "#fec44f", "#f03b20", "#800026"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
     elif layer_column == "turnout_rate":
-        color_map = cm.linear.Greens_09.scale(vmin, vmax)
+        color_map = cm.LinearColormap(
+            ["#f7fcf5", "#c7e9c0", "#41ab5d", "#005a32"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
     elif "cvap" in layer_column:
-        color_map = cm.linear.PuBuGn_09.scale(vmin, vmax)
+        color_map = cm.LinearColormap(
+            ["#f7fcfd", "#bfd3e6", "#8c96c6", "#88419d"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
     elif layer_column == "young_voter_turnout":
-        color_map = cm.linear.YlGnBu_09.scale(vmin, vmax)
+        color_map = cm.LinearColormap(
+            ["#ffffcc", "#a1dab4", "#41b6c4", "#225ea8"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
     else:
-        color_map = cm.linear.Viridis_09.scale(vmin, vmax)
+        color_map = cm.LinearColormap(
+            ["#440154", "#31688e", "#35b779", "#fde725"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
 
     if layer_column == "dem_share":
         color_map.caption = "Partisan result: darker blue = more Democratic, darker red = more Republican"
     elif layer_column == "rep_share":
         color_map.caption = "Republican share: darker red = higher Republican vote share"
+    elif layer_column == "turnout_rate":
+        color_map.caption = "Overall turnout: darker green = higher turnout"
+    elif layer_column == "total_dr_votes":
+        color_map.caption = "D + R votes: darker color = more Democratic + Republican votes"
     else:
         color_map.caption = LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
+    color_map.width = 360
+    color_map.height = 74
     return color_map
+
+
+def legend_formatter_script(layer_column: str | None) -> str:
+    """Format Folium legend tick labels so they are readable in the browser."""
+    if layer_column in PERCENT_COLUMNS:
+        mode = "percent"
+    elif layer_column == "total_dr_votes":
+        mode = "votes"
+    else:
+        mode = ""
+    if not mode:
+        return ""
+
+    return f"""
+    <script>
+    (function() {{
+        function formatLegendTicks() {{
+            document.querySelectorAll(".legend .tick text").forEach(function(label) {{
+                var raw = label.textContent.replace(/,/g, "").trim();
+                var value = Number(raw);
+                if (!Number.isFinite(value)) {{
+                    return;
+                }}
+                if ("{mode}" === "percent") {{
+                    label.textContent = Math.round(value * 100) + "%";
+                }} else if ("{mode}" === "votes") {{
+                    label.textContent = value >= 1000000
+                        ? (value / 1000000).toFixed(1) + "M"
+                        : Math.round(value / 1000) + "k";
+                }}
+            }});
+        }}
+        setTimeout(formatLegendTicks, 250);
+        setTimeout(formatLegendTicks, 900);
+        setTimeout(formatLegendTicks, 1600);
+    }})();
+    </script>
+    """
 
 
 def prepare_map_gdf(
@@ -1724,6 +1828,9 @@ def create_folium_map(
             }
 
         color_map.add_to(map_object)
+        formatter = legend_formatter_script(layer_column)
+        if formatter:
+            map_object.get_root().html.add_child(folium.Element(formatter))
     else:
         style_function = lambda _: {
             "fillColor": "#334155",
@@ -1742,12 +1849,21 @@ def create_folium_map(
             labels=True,
             max_width=360,
         )
+    popup = None
+    if tooltip_fields:
+        popup = folium.GeoJsonPopup(
+            fields=tooltip_fields,
+            aliases=tooltip_aliases,
+            labels=True,
+            max_width=380,
+        )
 
     folium.GeoJson(
         data=geojson_dict(map_gdf),
         name=geography,
         style_function=style_function,
         tooltip=tooltip,
+        popup=popup,
         highlight_function=lambda _: {"weight": 2.8, "color": "#f8fafc", "fillOpacity": 0.9},
     ).add_to(map_object)
 
@@ -1929,6 +2045,27 @@ def layer_categories(layers: list[dict[str, str]]) -> list[str]:
     return list(dict.fromkeys(layer["category"] for layer in layers))
 
 
+def map_status_text(state_name: str, geography: str, layer_label: str, layer_column: str | None) -> str:
+    """Write a plain-language sentence above the map."""
+    base = f"Showing {state_name} {geography.lower()}."
+    if layer_column == "dem_share":
+        return (
+            f"{base} Darker blue means a higher Democratic share; darker red means a higher "
+            "Republican share. Hover or click a district for exact percentages."
+        )
+    if layer_column == "rep_share":
+        return f"{base} Darker red means a higher Republican vote share. Hover or click for exact percentages."
+    if layer_column == "total_dr_votes":
+        return f"{base} Darker colors mean more Democratic plus Republican votes. Hover or click for exact vote totals."
+    if layer_column == "turnout_rate":
+        return f"{base} Darker green means higher turnout. Hover or click for the turnout percentage."
+    if layer_column and "cvap" in layer_column:
+        return f"{base} Darker purple means a higher {layer_label} share. Hover or click for exact CVAP percentages."
+    if layer_column == "young_voter_turnout":
+        return f"{base} Darker blue-green means higher young voter turnout. Hover or click for exact percentages."
+    return f"{base} Hover or click a district for available statistics."
+
+
 # ---------------------------------------------------------------------------
 # Streamlit app
 # ---------------------------------------------------------------------------
@@ -1944,6 +2081,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Map Controls")
+        st.caption(f"App version: {APP_VERSION}")
         st.markdown("### 1. Place")
         state_name = st.selectbox("State", list(STATE_CONFIG.keys()))
         source_data_available = has_state_source_data(state_name)
@@ -1993,6 +2131,7 @@ def main() -> None:
             geography,
             max_precinct_features,
             load_precinct_elections,
+            APP_VERSION,
         )
 
     for warning in state_data["warnings"]:
@@ -2050,7 +2189,7 @@ def main() -> None:
             for message in save_messages:
                 st.write(message)
 
-    st.caption(f"Showing {state_name} {geography.lower()} colored by {layer_label.lower()}.")
+    st.caption(map_status_text(state_name, geography, layer_label, layer_column))
     if geography == "Precincts":
         st.info(
             f"For speed, this view draws up to {max_precinct_features:,} precinct features. "
