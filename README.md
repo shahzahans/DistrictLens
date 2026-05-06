@@ -96,7 +96,7 @@ The sidebar groups available map layers into clearer categories. A category only
 
 ### Votes
 
-- Democratic share: Democratic votes divided by Democratic plus Republican votes.
+- Partisan result: blue districts voted more Democratic, red districts voted more Republican. Hover over a district for the exact percentages.
 - Republican share: Republican votes divided by Democratic plus Republican votes.
 - D + R votes: Democratic plus Republican votes.
 

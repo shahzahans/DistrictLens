@@ -78,9 +78,9 @@ STATE_CONFIG = {
 LAYER_DEFINITIONS = [
     {
         "category": "Votes",
-        "label": "Democratic share",
+        "label": "Partisan result (blue D / red R)",
         "column": "dem_share",
-        "description": "Two-party Democratic vote share: Democratic votes divided by Democratic plus Republican votes.",
+        "description": "Blue districts voted more Democratic; red districts voted more Republican. Hover for exact percentages.",
     },
     {
         "category": "Votes",
@@ -1408,9 +1408,19 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
             vmin, vmax = float(numeric.min()), float(numeric.max() or 1)
 
     if layer_column == "dem_share":
-        color_map = cm.LinearColormap(["#b2182b", "#f7f7f7", "#2166ac"], vmin=0, vmax=1)
+        color_map = cm.LinearColormap(
+            ["#7f0000", "#d73027", "#f7f7f7", "#2b83ba", "#08306b"],
+            index=[0, 0.4, 0.5, 0.6, 1],
+            vmin=0,
+            vmax=1,
+        )
     elif layer_column == "rep_share":
-        color_map = cm.LinearColormap(["#2166ac", "#f7f7f7", "#b2182b"], vmin=0, vmax=1)
+        color_map = cm.LinearColormap(
+            ["#08306b", "#2b83ba", "#f7f7f7", "#d73027", "#7f0000"],
+            index=[0, 0.4, 0.5, 0.6, 1],
+            vmin=0,
+            vmax=1,
+        )
     elif layer_column == "total_dr_votes":
         color_map = cm.linear.YlOrRd_09.scale(vmin, vmax)
     elif layer_column == "turnout_rate":
@@ -1422,7 +1432,12 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     else:
         color_map = cm.linear.Viridis_09.scale(vmin, vmax)
 
-    color_map.caption = LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
+    if layer_column == "dem_share":
+        color_map.caption = "Partisan result: darker blue = more Democratic, darker red = more Republican"
+    elif layer_column == "rep_share":
+        color_map.caption = "Republican share: darker red = higher Republican vote share"
+    else:
+        color_map.caption = LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
     return color_map
 
 
@@ -1491,13 +1506,40 @@ def format_tooltip_fields(
 ) -> tuple[gpd.GeoDataFrame, list[str], list[str], list[str]]:
     """Add formatted tooltip columns and return field names and aliases."""
     detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
-    tooltip_specs = []
+    formatted_gdf = gdf.copy()
+    fields = []
+    aliases = []
+
+    def add_tooltip_value(alias: str, values: pd.Series) -> None:
+        field = f"tooltip_{len(fields)}"
+        formatted_gdf[field] = values
+        fields.append(field)
+        aliases.append(alias)
 
     id_col = detected.get("district_id") if geography == "Congressional Districts" else detected.get("precinct_id")
     if id_col in gdf.columns:
-        tooltip_specs.append(("ID", id_col, "text"))
+        id_label = "District" if geography == "Congressional Districts" else "Precinct"
+        add_tooltip_value(id_label, gdf[id_col].map(lambda value: "Not available" if pd.isna(value) else str(value)))
     if detected.get("county") in gdf.columns:
-        tooltip_specs.append(("County/Parish", detected["county"], "text"))
+        add_tooltip_value(
+            "County/Parish",
+            gdf[detected["county"]].map(lambda value: "Not available" if pd.isna(value) else str(value)),
+        )
+
+    if "dem_share" in gdf.columns and "rep_share" in gdf.columns:
+        dem_share = safe_numeric(gdf["dem_share"])
+        rep_share = safe_numeric(gdf["rep_share"])
+        winner = pd.Series(np.nan, index=gdf.index, dtype="object")
+        winner_share = pd.Series(np.nan, index=gdf.index, dtype="float64")
+        valid = dem_share.notna() & rep_share.notna()
+        dem_won = valid & (dem_share >= rep_share)
+        rep_won = valid & (rep_share > dem_share)
+        winner.loc[dem_won] = "Democratic"
+        winner.loc[rep_won] = "Republican"
+        winner_share.loc[dem_won] = dem_share.loc[dem_won]
+        winner_share.loc[rep_won] = rep_share.loc[rep_won]
+        add_tooltip_value("Vote winner", winner.fillna("Not available"))
+        add_tooltip_value("Winner share", winner_share.map(format_percent))
 
     standard_specs = [
         ("Democratic votes", "dem_votes", "number"),
@@ -1513,23 +1555,19 @@ def format_tooltip_fields(
         ("Minority CVAP", "minority_cvap_pct", "percent"),
         ("Young turnout", "young_voter_turnout", "percent"),
     ]
-    tooltip_specs.extend(spec for spec in standard_specs if spec[1] in gdf.columns)
 
-    formatted_gdf = gdf.copy()
-    fields = []
-    aliases = []
-    for index, (alias, source_col, kind) in enumerate(tooltip_specs):
-        field = f"tooltip_{index}"
+    for alias, source_col, kind in standard_specs:
+        if source_col not in gdf.columns:
+            continue
         if kind == "number":
-            formatted_gdf[field] = formatted_gdf[source_col].map(format_number)
+            values = formatted_gdf[source_col].map(format_number)
         elif kind == "percent":
-            formatted_gdf[field] = formatted_gdf[source_col].map(format_percent)
+            values = formatted_gdf[source_col].map(format_percent)
         else:
-            formatted_gdf[field] = formatted_gdf[source_col].map(
+            values = formatted_gdf[source_col].map(
                 lambda value: "Not available" if pd.isna(value) else str(value)
             )
-        fields.append(field)
-        aliases.append(alias)
+        add_tooltip_value(alias, values)
 
     return formatted_gdf, fields, aliases, fields
 
@@ -1569,6 +1607,7 @@ def add_district_overlay(map_object: folium.Map, district_gdf: gpd.GeoDataFrame 
     folium.GeoJson(
         data=geojson_dict(overlay),
         name="Congressional District Boundary Overlay",
+        interactive=False,
         style_function=lambda _: {
             "fillOpacity": 0,
             "color": "#f8fafc",
@@ -1678,10 +1717,10 @@ def create_folium_map(
                 fill_color = color_map(float(numeric))
             return {
                 "fillColor": fill_color,
-                "color": "#cbd5e1",
-                "weight": 0.45,
-                "fillOpacity": 0.78,
-                "opacity": 0.72,
+                "color": "#f8fafc",
+                "weight": 0.65,
+                "fillOpacity": 0.9,
+                "opacity": 0.85,
             }
 
         color_map.add_to(map_object)
@@ -1915,15 +1954,20 @@ def main() -> None:
 
         st.markdown("### 2. Data Loading")
         max_precinct_features = MAX_MAP_FEATURES
-        load_precinct_elections = geography == "Congressional Districts" and state_name == "Louisiana"
-        if geography == "Congressional Districts":
+        load_precinct_elections = False
+        if geography == "Congressional Districts" and source_data_available:
             load_precinct_elections = st.checkbox(
-                "Load precinct vote totals",
+                "Recalculate district votes from precincts",
                 value=state_name == "Louisiana",
                 help=(
-                    "Needed for district Democratic/Republican vote-share layers. "
-                    "California's precinct file is very large, so leave this off for a fast first load."
+                    "Reads the large raw precinct file and aggregates Democratic/Republican votes to districts. "
+                    "If a district vote cache already exists, the map may look the same."
                 ),
+            )
+        elif geography == "Congressional Districts":
+            st.caption(
+                "The deployed app already includes precomputed district vote totals. "
+                "Raw precinct ZIP files are too large to bundle here, so there is no precinct reload button online."
             )
         if geography == "Precincts":
             max_precinct_features = st.slider(
