@@ -96,7 +96,7 @@ The sidebar groups available map layers into clearer categories. A category only
 
 ### Votes
 
-- Partisan result: blue districts voted more Democratic, red districts voted more Republican. Hover over a district for the exact percentages.
+- Party winner + vote volume: blue districts voted more Democratic, red districts voted more Republican, and darker color means more Democratic plus Republican votes. Hover over a district for exact votes and percentages.
 - Republican share: Republican votes divided by Democratic plus Republican votes.
 - D + R votes: Democratic plus Republican votes.
 
