@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 hardcoded-scale-ticks"
+APP_VERSION = "2026-05-06 hide-republican-share-layer"
 
 STATE_CONFIG = {
     "California": {
@@ -82,12 +82,6 @@ LAYER_DEFINITIONS = [
         "label": "Party winner + vote volume",
         "column": "dem_share",
         "description": "Blue means Democratic winner and red means Republican winner. Darker color means more D + R votes.",
-    },
-    {
-        "category": "Votes",
-        "label": "Republican share",
-        "column": "rep_share",
-        "description": "Two-party Republican vote share: Republican votes divided by Democratic plus Republican votes.",
     },
     {
         "category": "Votes",
