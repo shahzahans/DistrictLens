@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 turnout-contrast-scale"
+APP_VERSION = "2026-05-06 party-volume-shading"
 
 STATE_CONFIG = {
     "California": {
@@ -79,9 +79,9 @@ STATE_CONFIG = {
 LAYER_DEFINITIONS = [
     {
         "category": "Votes",
-        "label": "Partisan result (blue D / red R)",
+        "label": "Party winner + vote volume",
         "column": "dem_share",
-        "description": "Blue districts voted more Democratic; red districts voted more Republican. Hover for exact percentages.",
+        "description": "Blue means Democratic winner, red means Republican winner. Light shades have fewer D + R votes; dark shades have more.",
     },
     {
         "category": "Votes",
@@ -1502,10 +1502,143 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     return color_map
 
 
+def compact_number(value: float) -> str:
+    """Short labels for map legends."""
+    if pd.isna(value):
+        return "N/A"
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if abs(value) >= 1_000:
+        return f"{round(value / 1_000):,.0f}k"
+    return f"{value:,.0f}"
+
+
+def interpolate_hex_color(light_hex: str, dark_hex: str, amount: float) -> str:
+    """Blend from a light color to a dark color."""
+    amount = max(0, min(1, amount))
+    light = light_hex.lstrip("#")
+    dark = dark_hex.lstrip("#")
+    light_rgb = tuple(int(light[index : index + 2], 16) for index in (0, 2, 4))
+    dark_rgb = tuple(int(dark[index : index + 2], 16) for index in (0, 2, 4))
+    blended = tuple(round(light_rgb[i] + (dark_rgb[i] - light_rgb[i]) * amount) for i in range(3))
+    return "#{:02x}{:02x}{:02x}".format(*blended)
+
+
+def vote_volume_bounds(gdf: gpd.GeoDataFrame) -> tuple[float, float]:
+    """Use the actual vote-volume range while trimming extreme outliers."""
+    votes = safe_numeric(gdf.get("total_dr_votes", pd.Series(dtype="float64"))).dropna()
+    if votes.empty:
+        return 0, 1
+    vmin = float(votes.quantile(0.02))
+    vmax = float(votes.quantile(0.98))
+    if vmin == vmax:
+        vmin, vmax = float(votes.min()), float(votes.max())
+    if vmin == vmax:
+        vmax = vmin + 1
+    return vmin, vmax
+
+
+def party_vote_volume_color(dem_share: Any, total_votes: Any, bounds: tuple[float, float]) -> str:
+    """Color districts by winner, with shade intensity based on D + R vote volume."""
+    dem_value = safe_numeric(pd.Series([dem_share])).iloc[0]
+    vote_value = safe_numeric(pd.Series([total_votes])).iloc[0]
+    if pd.isna(dem_value):
+        return "#d9d9d9"
+
+    vmin, vmax = bounds
+    if pd.isna(vote_value):
+        amount = 0.5
+    else:
+        amount = max(0, min(1, (float(vote_value) - vmin) / (vmax - vmin)))
+
+    if dem_value >= 0.5:
+        return interpolate_hex_color("#bfdbfe", "#1e3a8a", amount)
+    return interpolate_hex_color("#fecaca", "#7f1d1d", amount)
+
+
+def party_vote_volume_legend_script(map_name: str, bounds: tuple[float, float]) -> str:
+    """Custom legend for party winner plus vote volume shading."""
+    vmin, vmax = bounds
+    vmid = (vmin + vmax) / 2
+    return f"""
+    <style>
+    .party-volume-legend {{
+        background: rgba(15, 23, 42, 0.92) !important;
+        color: #f8fafc !important;
+        border: 1px solid rgba(148, 163, 184, 0.45) !important;
+        border-radius: 6px !important;
+        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35) !important;
+        padding: 8px 10px 10px 10px !important;
+        width: 390px;
+    }}
+    .party-volume-ticks {{
+        display: flex;
+        justify-content: space-between;
+        margin: 0 0 3px 0;
+        font-weight: 700;
+        font-size: 13px;
+    }}
+    .party-volume-row {{
+        display: grid;
+        grid-template-columns: 34px 1fr;
+        gap: 8px;
+        align-items: center;
+        margin-top: 4px;
+        font-size: 12px;
+        font-weight: 700;
+    }}
+    .party-volume-bar {{
+        height: 16px;
+        border-radius: 2px;
+    }}
+    .party-volume-red {{
+        background: linear-gradient(to right, #fecaca, #ef4444, #7f1d1d);
+    }}
+    .party-volume-blue {{
+        background: linear-gradient(to right, #bfdbfe, #3b82f6, #1e3a8a);
+    }}
+    .party-volume-title {{
+        margin-top: 7px;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+    }}
+    .party-volume-note {{
+        margin-top: 2px;
+        color: #cbd5e1;
+        font-size: 11px;
+        line-height: 1.2;
+    }}
+    </style>
+    <script>
+    (function() {{
+        var control = L.control({{position: "topright"}});
+        control.onAdd = function(map) {{
+            var div = L.DomUtil.create("div", "party-volume-legend leaflet-control");
+            div.innerHTML = `
+                <div class="party-volume-ticks">
+                    <span>{compact_number(vmin)}</span>
+                    <span>{compact_number(vmid)}</span>
+                    <span>{compact_number(vmax)}</span>
+                </div>
+                <div class="party-volume-row"><span>Rep</span><div class="party-volume-bar party-volume-red"></div></div>
+                <div class="party-volume-row"><span>Dem</span><div class="party-volume-bar party-volume-blue"></div></div>
+                <div class="party-volume-title">Party winner + D/R votes</div>
+                <div class="party-volume-note">Light = fewer D + R votes, dark = more D + R votes</div>
+            `;
+            L.DomEvent.disableClickPropagation(div);
+            return div;
+        }};
+        control.addTo({map_name});
+    }})();
+    </script>
+    """
+
+
 def legend_title(layer_column: str | None) -> str:
     """Return the short title shown below the legend scale."""
     if layer_column == "dem_share":
-        return "Partisan result"
+        return "Party winner + vote volume"
     if layer_column == "rep_share":
         return "Republican share"
     if layer_column == "turnout_rate":
@@ -1599,6 +1732,8 @@ def prepare_map_gdf(
     keep_columns = [column for column in tooltip_columns if column in gdf.columns]
     if layer_column and layer_column in gdf.columns:
         keep_columns.append(layer_column)
+    if layer_column == "dem_share" and "total_dr_votes" in gdf.columns:
+        keep_columns.append("total_dr_votes")
     keep_columns = list(dict.fromkeys(keep_columns))
 
     map_gdf = gdf[keep_columns + ["geometry"]].copy()
@@ -1620,6 +1755,8 @@ def prepare_map_gdf(
 
     if layer_column and layer_column in map_gdf.columns:
         map_gdf[layer_column] = safe_numeric(map_gdf[layer_column])
+    if layer_column == "dem_share" and "total_dr_votes" in map_gdf.columns:
+        map_gdf["total_dr_votes"] = safe_numeric(map_gdf["total_dr_votes"])
 
     for column in keep_columns:
         if column in map_gdf.columns and column != "geometry":
@@ -1866,7 +2003,28 @@ def create_folium_map(
         st.warning("No valid geometry was available for the selected map.")
         return map_object
 
-    if layer_column and layer_column in map_gdf.columns:
+    if layer_column == "dem_share" and "total_dr_votes" in map_gdf.columns:
+        bounds = vote_volume_bounds(map_gdf)
+
+        def style_function(feature: dict[str, Any]) -> dict[str, Any]:
+            properties = feature["properties"]
+            fill_color = party_vote_volume_color(
+                properties.get("dem_share"),
+                properties.get("total_dr_votes"),
+                bounds,
+            )
+            return {
+                "fillColor": fill_color,
+                "color": "#f8fafc",
+                "weight": 0.65,
+                "fillOpacity": 0.9,
+                "opacity": 0.85,
+            }
+
+        map_object.get_root().html.add_child(
+            folium.Element(party_vote_volume_legend_script(map_object.get_name(), bounds))
+        )
+    elif layer_column and layer_column in map_gdf.columns:
         color_map = layer_colormap(layer_column, map_gdf[layer_column])
 
         def style_function(feature: dict[str, Any]) -> dict[str, Any]:
@@ -2107,8 +2265,8 @@ def map_status_text(state_name: str, geography: str, layer_label: str, layer_col
     base = f"Showing {state_name} {geography.lower()}."
     if layer_column == "dem_share":
         return (
-            f"{base} Darker blue means a higher Democratic share; darker red means a higher "
-            "Republican share. Hover or click a district for exact percentages."
+            f"{base} Blue districts were won by Democrats, red districts were won by Republicans. "
+            "Light shades have fewer D + R votes; dark shades have more. Hover or click for exact percentages."
         )
     if layer_column == "rep_share":
         return f"{base} Darker red means a higher Republican vote share. Hover or click for exact percentages."
