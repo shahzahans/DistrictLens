@@ -96,7 +96,7 @@ The sidebar groups available map layers into clearer categories. A category only
 
 ### Votes
 
-- Party winner + vote volume: blue districts voted more Democratic, red districts voted more Republican, and darker color means more Democratic plus Republican votes. Hover over a district for exact votes and percentages.
+- Party winner strength: blue districts voted more Democratic, red districts voted more Republican, and darker color means the winner was farther above 50%. Hover over a district for exact votes and percentages.
 - D + R votes: Democratic plus Republican votes.
 
 ### Turnout
