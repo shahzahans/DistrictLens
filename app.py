@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 party-volume-v2"
+APP_VERSION = "2026-05-06 fixed-party-legend"
 
 STATE_CONFIG = {
     "California": {
@@ -1581,9 +1581,69 @@ def party_vote_volume_color(properties: dict[str, Any], bounds: dict[str, tuple[
     return interpolate_hex_color("#f8c7c2", "#99000d", volume_amount)
 
 
-def party_vote_volume_legend_script(map_name: str) -> str:
-    """Create a custom legend for the party-winner-plus-volume layer."""
-    legend_html = """
+def party_vote_volume_legend_html() -> str:
+    """Create a fixed legend for the party-winner-plus-volume layer."""
+    return """
+    <style>
+    .party-volume-legend {
+        position: fixed !important;
+        top: 14px !important;
+        right: 14px !important;
+        z-index: 999999 !important;
+        background: rgba(15, 23, 42, 0.92) !important;
+        color: #f8fafc !important;
+        border: 1px solid rgba(148, 163, 184, 0.45) !important;
+        border-radius: 6px !important;
+        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35) !important;
+        padding: 9px 12px 10px 12px !important;
+        width: 360px !important;
+        pointer-events: none !important;
+    }
+    .party-volume-ticks {
+        display: flex;
+        justify-content: space-between;
+        padding-left: 22px;
+        color: #f8fafc;
+        font-weight: 700;
+        line-height: 1.1;
+        margin-bottom: 3px;
+    }
+    .party-volume-row {
+        display: grid;
+        grid-template-columns: 18px 1fr;
+        align-items: center;
+        gap: 6px;
+        margin-top: 4px;
+        color: #f8fafc;
+        font-size: 12px;
+        font-weight: 800;
+    }
+    .party-volume-bar {
+        height: 14px;
+        border-radius: 1px;
+    }
+    .party-volume-dem {
+        background: linear-gradient(90deg, #c7e9ff 0%, #5aa5d8 50%, #0050a4 100%);
+    }
+    .party-volume-rep {
+        background: linear-gradient(90deg, #f8c7c2 0%, #dc5a50 50%, #99000d 100%);
+    }
+    .party-volume-title {
+        color: #f8fafc;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+        margin: 7px 0 0 24px;
+        white-space: nowrap;
+    }
+    @media (max-width: 700px) {
+        .party-volume-legend {
+            width: 280px !important;
+            right: 8px !important;
+        }
+    }
+    </style>
+    <div class="party-volume-legend leaflet-control">
         <div class="party-volume-ticks">
             <span>0.0</span><span>0.5</span><span>1.0</span>
         </div>
@@ -1594,80 +1654,7 @@ def party_vote_volume_legend_script(map_name: str) -> str:
             <span>R</span><div class="party-volume-bar party-volume-rep"></div>
         </div>
         <div class="party-volume-title">Party winner + vote volume</div>
-    """
-    return f"""
-    <style>
-    .party-volume-legend {{
-        background: rgba(15, 23, 42, 0.92) !important;
-        color: #f8fafc !important;
-        border: 1px solid rgba(148, 163, 184, 0.45) !important;
-        border-radius: 6px !important;
-        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35) !important;
-        padding: 9px 12px 10px 12px !important;
-        width: 360px !important;
-    }}
-    .party-volume-ticks {{
-        display: flex;
-        justify-content: space-between;
-        padding-left: 22px;
-        color: #f8fafc;
-        font-weight: 700;
-        line-height: 1.1;
-        margin-bottom: 3px;
-    }}
-    .party-volume-row {{
-        display: grid;
-        grid-template-columns: 18px 1fr;
-        align-items: center;
-        gap: 6px;
-        margin-top: 4px;
-        color: #f8fafc;
-        font-size: 12px;
-        font-weight: 800;
-    }}
-    .party-volume-bar {{
-        height: 14px;
-        border-radius: 1px;
-    }}
-    .party-volume-dem {{
-        background: linear-gradient(90deg, #c7e9ff 0%, #5aa5d8 50%, #0050a4 100%);
-    }}
-    .party-volume-rep {{
-        background: linear-gradient(90deg, #f8c7c2 0%, #dc5a50 50%, #99000d 100%);
-    }}
-    .party-volume-title {{
-        color: #f8fafc;
-        font-size: 13px;
-        font-weight: 700;
-        line-height: 1.2;
-        margin: 7px 0 0 24px;
-        white-space: nowrap;
-    }}
-    </style>
-    <script>
-    (function() {{
-        var legendHtml = {json.dumps(legend_html)};
-        function addPartyVolumeLegend() {{
-            if (typeof L === "undefined" || typeof {map_name} === "undefined") {{
-                setTimeout(addPartyVolumeLegend, 250);
-                return;
-            }}
-            if (document.querySelector(".party-volume-legend")) {{
-                return;
-            }}
-            var legend = L.control({{position: "topright"}});
-            legend.onAdd = function() {{
-                var div = L.DomUtil.create("div", "party-volume-legend leaflet-control");
-                div.innerHTML = legendHtml;
-                L.DomEvent.disableClickPropagation(div);
-                return div;
-            }};
-            legend.addTo({map_name});
-        }}
-        setTimeout(addPartyVolumeLegend, 250);
-        setTimeout(addPartyVolumeLegend, 900);
-    }})();
-    </script>
+    </div>
     """
 
 
@@ -2056,7 +2043,7 @@ def create_folium_map(
             }
 
         map_object.get_root().html.add_child(
-            folium.Element(party_vote_volume_legend_script(map_object.get_name()))
+            folium.Element(party_vote_volume_legend_html())
         )
     elif layer_column and layer_column in map_gdf.columns:
         color_map = layer_colormap(layer_column, map_gdf[layer_column])
