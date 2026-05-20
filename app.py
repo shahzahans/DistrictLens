@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 proposed-plan-mode"
+APP_VERSION = "2026-05-20 boundary-edit-mode"
 
 STATE_CONFIG = {
     "California": {
@@ -3056,6 +3056,102 @@ def create_proposed_plan_map(
     return map_object
 
 
+def district_label_map(gdf: gpd.GeoDataFrame) -> dict[str, Any]:
+    """Map display district labels to GeoDataFrame indexes."""
+    id_column = district_id_column(gdf)
+    labels: dict[str, Any] = {}
+    attrs = gdf.drop(columns="geometry", errors="ignore")
+    for index, row in attrs.iterrows():
+        value = row[id_column] if id_column in row.index else index
+        label = format_district_label(value)
+        labels[label] = index
+    return dict(sorted(labels.items(), key=lambda item: natural_sort_key(item[0])))
+
+
+def current_plan_items(gdf: gpd.GeoDataFrame) -> list[dict[str, Any]]:
+    """Convert current district geometries into proposed-plan item objects."""
+    labels = district_label_map(gdf)
+    items = []
+    for label, index in labels.items():
+        geometry = gdf.loc[index].geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        items.append({"label": label, "geometry": geometry, "properties": {"source": "current"}})
+    return items
+
+
+def safe_geometry(geometry: Any) -> Any:
+    """Repair a geometry when possible without failing the app."""
+    if geometry is None or geometry.is_empty:
+        return geometry
+    try:
+        if not geometry.is_valid:
+            return geometry.buffer(0)
+    except Exception:
+        return geometry
+    return geometry
+
+
+def boundary_adjusted_plan_items(
+    district_gdf: gpd.GeoDataFrame,
+    source_label: str,
+    target_label: str,
+    transfer_geometry: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Move a drawn area from one district into another and return a full proposed plan."""
+    labels = district_label_map(district_gdf)
+    if source_label not in labels or target_label not in labels or source_label == target_label:
+        return [], {"error": "Choose two different valid districts."}
+    if transfer_geometry is None or transfer_geometry.is_empty:
+        return [], {"error": "Draw an area to transfer before estimating the boundary edit."}
+
+    source_index = labels[source_label]
+    target_index = labels[target_label]
+    source_geometry = safe_geometry(district_gdf.loc[source_index].geometry)
+    target_geometry = safe_geometry(district_gdf.loc[target_index].geometry)
+    transfer_geometry = safe_geometry(transfer_geometry)
+
+    try:
+        moved_piece = safe_geometry(source_geometry.intersection(transfer_geometry))
+    except Exception:
+        return [], {"error": "The drawn transfer area could not be intersected with the source district."}
+    if moved_piece is None or moved_piece.is_empty:
+        return [], {"error": f"The drawn transfer area does not overlap District {source_label}."}
+
+    try:
+        new_source = safe_geometry(source_geometry.difference(moved_piece))
+        new_target = safe_geometry(target_geometry.union(moved_piece))
+    except Exception:
+        return [], {"error": "The boundary edit geometry could not be created."}
+    if new_source is None or new_source.is_empty:
+        return [], {"error": f"The edit would remove all of District {source_label}."}
+
+    items = current_plan_items(district_gdf)
+    for item in items:
+        if item["label"] == source_label:
+            item["geometry"] = new_source
+            item["properties"] = {"source": "edited_source"}
+        elif item["label"] == target_label:
+            item["geometry"] = new_target
+            item["properties"] = {"source": "edited_target"}
+
+    metrics = proposed_geometry_metrics(moved_piece)
+    metrics.update(
+        {
+            "source_label": source_label,
+            "target_label": target_label,
+            "moved_geometry": moved_piece,
+        }
+    )
+    return items, metrics
+
+
+def boundary_edit_preview_items(plan_items: list[dict[str, Any]], labels: list[str]) -> list[dict[str, Any]]:
+    """Return only changed districts for lightweight map preview."""
+    label_set = set(labels)
+    return [item for item in plan_items if item["label"] in label_set]
+
+
 def format_overlap_table(overlaps: pd.DataFrame) -> pd.DataFrame:
     """Format current-district overlap rows for display."""
     if overlaps.empty:
@@ -3329,37 +3425,101 @@ def display_proposed_plan_mode(
 
     st.subheader("Proposed Plan Mode")
     st.caption(
-        "Draw multiple districts or upload a proposed-plan GeoJSON. The comparison estimates outcomes from current district overlaps."
+        "Edit current boundaries, draw multiple districts, or upload a proposed-plan GeoJSON. Estimates update from current district overlaps."
     )
 
-    upload_key = f"{state_name}_proposed_plan_geojson_upload"
-    uploaded_file = st.file_uploader(
-        "Upload proposed plan GeoJSON",
-        type=["geojson", "json"],
-        key=upload_key,
+    plan_mode = st.radio(
+        "Proposed plan method",
+        ["Boundary edit from current plan", "Draw or upload custom plan"],
+        horizontal=True,
+        key=f"{state_name}_proposed_plan_method",
     )
-    uploaded_items = uploaded_geojson_plan(uploaded_file)
-    if uploaded_file is not None and not uploaded_items:
-        st.warning("The uploaded file could not be read as proposed district GeoJSON.")
 
-    session_key = f"{state_name}_proposed_plan_drawings"
-    if st.button("Clear proposed plan drawings", key=f"{state_name}_clear_proposed_plan"):
-        st.session_state.pop(session_key, None)
+    proposed_items: list[dict[str, Any]] = []
+    preview_items: list[dict[str, Any]] = []
+    moved_metrics: dict[str, Any] = {}
 
-    draw_map = create_proposed_plan_map(district_gdf, state_name, simplify, uploaded_items)
-    draw_output = st_folium(
-        draw_map,
-        height=560,
-        use_container_width=True,
-        returned_objects=["last_active_drawing", "all_drawings"],
-        key=f"{state_name}_proposed_plan_draw_map",
-    )
-    drawn_items = drawn_plan_geometries(draw_output, session_key)
-    proposed_items = uploaded_items if uploaded_items else drawn_items
+    if plan_mode == "Boundary edit from current plan":
+        labels = list(district_label_map(district_gdf).keys())
+        source_col, target_col = st.columns(2)
+        with source_col:
+            source_label = st.selectbox(
+                "Move area from district",
+                labels,
+                key=f"{state_name}_boundary_source_district",
+            )
+        target_options = [label for label in labels if label != source_label]
+        with target_col:
+            target_label = st.selectbox(
+                "Move area into district",
+                target_options,
+                key=f"{state_name}_boundary_target_district",
+            )
 
-    if not proposed_items:
-        st.info("Draw multiple polygons/rectangles or upload a GeoJSON FeatureCollection to compare a proposed plan.")
-        return
+        boundary_session_key = f"{state_name}_boundary_transfer_feature"
+        if st.button("Clear boundary edit", key=f"{state_name}_clear_boundary_edit"):
+            st.session_state.pop(boundary_session_key, None)
+
+        draw_map = create_hypothetical_draw_map(district_gdf, state_name, simplify)
+        draw_output = st_folium(
+            draw_map,
+            height=560,
+            use_container_width=True,
+            returned_objects=["last_active_drawing", "all_drawings"],
+            key=f"{state_name}_boundary_edit_draw_map",
+        )
+        transfer_geometry = latest_drawn_geometry(draw_output, boundary_session_key)
+        proposed_items, moved_metrics = boundary_adjusted_plan_items(
+            district_gdf,
+            source_label,
+            target_label,
+            transfer_geometry,
+        )
+        if moved_metrics.get("error"):
+            st.info(moved_metrics["error"])
+            return
+        preview_items = boundary_edit_preview_items(proposed_items, [source_label, target_label])
+        st.caption(
+            f"Moved area estimate: {format_square_miles(moved_metrics.get('district_area_sq_mi'))} "
+            f"from District {source_label} into District {target_label}."
+        )
+        preview_map = create_proposed_plan_map(district_gdf, state_name, simplify, preview_items)
+        st_folium(
+            preview_map,
+            height=420,
+            use_container_width=True,
+            returned_objects=[],
+            key=f"{state_name}_boundary_preview_map",
+        )
+    else:
+        upload_key = f"{state_name}_proposed_plan_geojson_upload"
+        uploaded_file = st.file_uploader(
+            "Upload proposed plan GeoJSON",
+            type=["geojson", "json"],
+            key=upload_key,
+        )
+        uploaded_items = uploaded_geojson_plan(uploaded_file)
+        if uploaded_file is not None and not uploaded_items:
+            st.warning("The uploaded file could not be read as proposed district GeoJSON.")
+
+        session_key = f"{state_name}_proposed_plan_drawings"
+        if st.button("Clear proposed plan drawings", key=f"{state_name}_clear_proposed_plan"):
+            st.session_state.pop(session_key, None)
+
+        draw_map = create_proposed_plan_map(district_gdf, state_name, simplify, uploaded_items)
+        draw_output = st_folium(
+            draw_map,
+            height=560,
+            use_container_width=True,
+            returned_objects=["last_active_drawing", "all_drawings"],
+            key=f"{state_name}_proposed_plan_draw_map",
+        )
+        drawn_items = drawn_plan_geometries(draw_output, session_key)
+        proposed_items = uploaded_items if uploaded_items else drawn_items
+
+        if not proposed_items:
+            st.info("Draw multiple polygons/rectangles or upload a GeoJSON FeatureCollection to compare a proposed plan.")
+            return
 
     estimates = estimate_proposed_plan(district_gdf, proposed_items)
     if estimates.empty:
