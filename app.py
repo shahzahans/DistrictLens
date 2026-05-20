@@ -15,8 +15,11 @@ import numpy as np
 import pandas as pd
 import pyogrio
 import streamlit as st
+from folium.plugins import Draw
 from pandas.errors import PerformanceWarning
+from shapely.geometry import shape
 from shapely.errors import GEOSException
+from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 python_warnings.filterwarnings("ignore", category=PerformanceWarning)
@@ -32,7 +35,8 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-20 district-scorecard"
+MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
+APP_VERSION = "2026-05-20 hypothetical-district-tool"
 
 STATE_CONFIG = {
     "California": {
@@ -2521,6 +2525,328 @@ def display_district_scorecard(gdf: gpd.GeoDataFrame, state_name: str) -> None:
         st.dataframe(ranking_table, hide_index=True, use_container_width=True, height=table_height)
 
 
+def geometry_from_geojson(data: dict[str, Any]) -> Any | None:
+    """Return a single shapely geometry from a GeoJSON object."""
+    try:
+        if data.get("type") == "FeatureCollection":
+            geometries = [
+                shape(feature["geometry"])
+                for feature in data.get("features", [])
+                if feature.get("geometry")
+            ]
+            geometries = [geometry for geometry in geometries if not geometry.is_empty]
+            return unary_union(geometries) if geometries else None
+        if data.get("type") == "Feature":
+            return shape(data["geometry"]) if data.get("geometry") else None
+        if data.get("type"):
+            return shape(data)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def latest_drawn_geometry(draw_output: dict[str, Any] | None, session_key: str) -> Any | None:
+    """Get the latest drawn geometry from streamlit-folium, preserving it across reruns."""
+    if not draw_output:
+        return geometry_from_geojson(st.session_state.get(session_key, {}))
+
+    drawings = draw_output.get("all_drawings") or []
+    if drawings:
+        st.session_state[session_key] = drawings[-1]
+        return geometry_from_geojson(drawings[-1])
+
+    last_drawing = draw_output.get("last_active_drawing")
+    if last_drawing:
+        st.session_state[session_key] = last_drawing
+        return geometry_from_geojson(last_drawing)
+
+    return geometry_from_geojson(st.session_state.get(session_key, {}))
+
+
+def uploaded_geojson_geometry(uploaded_file: Any) -> Any | None:
+    """Read a Streamlit uploaded GeoJSON file into one shapely geometry."""
+    if uploaded_file is None:
+        return None
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8-sig"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return geometry_from_geojson(data)
+
+
+def projected_area_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Project data to a continental equal-area CRS for overlap calculations."""
+    if gdf.crs is None:
+        gdf = gdf.set_crs(4326, allow_override=True)
+    return gdf.to_crs(5070)
+
+
+def estimate_hypothetical_district(
+    district_gdf: gpd.GeoDataFrame,
+    proposed_geometry: Any,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Estimate district metrics from area-weighted overlap with current districts."""
+    if district_gdf is None or district_gdf.empty or proposed_geometry is None or proposed_geometry.is_empty:
+        return {}, pd.DataFrame()
+
+    proposed_gdf = gpd.GeoDataFrame({"geometry": [proposed_geometry]}, crs=4326)
+    districts_equal_area = projected_area_gdf(district_gdf)
+    proposed_equal_area = projected_area_gdf(proposed_gdf).geometry.iloc[0]
+
+    if proposed_equal_area.is_empty:
+        return {}, pd.DataFrame()
+    if not proposed_equal_area.is_valid:
+        proposed_equal_area = proposed_equal_area.buffer(0)
+    proposed_area = proposed_equal_area.area
+    if proposed_area <= 0:
+        return {}, pd.DataFrame()
+
+    district_col = district_id_column(district_gdf)
+    overlap_rows = []
+    for index, district_row in districts_equal_area.iterrows():
+        geometry = district_row.geometry
+        if geometry is None or geometry.is_empty or not geometry.intersects(proposed_equal_area):
+            continue
+        overlap = geometry.intersection(proposed_equal_area)
+        if overlap.is_empty:
+            continue
+        overlap_area = overlap.area
+        if overlap_area <= 0:
+            continue
+        share_of_proposed = overlap_area / proposed_area
+        if share_of_proposed < MIN_HYPOTHETICAL_OVERLAP_SHARE:
+            continue
+        current_area = geometry.area
+        original_row = district_gdf.loc[index]
+        district_value = original_row[district_col] if district_col in district_gdf.columns else index
+        overlap_rows.append(
+            {
+                "district": format_district_label(district_value),
+                "overlap_area": overlap_area,
+                "share_of_proposed": share_of_proposed,
+                "share_of_current_district": overlap_area / current_area if current_area else np.nan,
+                "source_index": index,
+            }
+        )
+
+    overlaps = pd.DataFrame(overlap_rows)
+    if overlaps.empty:
+        return {"coverage_pct": 0, "intersecting_districts": 0}, overlaps
+
+    metrics: dict[str, Any] = {
+        "coverage_pct": min(float(overlaps["share_of_proposed"].sum()), 1.0),
+        "intersecting_districts": len(overlaps),
+    }
+
+    count_columns = ["dem_votes", "rep_votes", "total_votes", "registered_voters"]
+    for column in count_columns:
+        if column not in district_gdf.columns:
+            continue
+        estimated = 0.0
+        has_values = False
+        for _, overlap_row in overlaps.iterrows():
+            value = safe_numeric(pd.Series([district_gdf.loc[overlap_row["source_index"], column]])).iloc[0]
+            if pd.notna(value):
+                estimated += float(value) * float(overlap_row["share_of_current_district"])
+                has_values = True
+        if has_values:
+            metrics[column] = estimated
+
+    if "dem_votes" in metrics and "rep_votes" in metrics:
+        metrics["total_dr_votes"] = metrics["dem_votes"] + metrics["rep_votes"]
+        if metrics["total_dr_votes"]:
+            metrics["dem_share"] = metrics["dem_votes"] / metrics["total_dr_votes"]
+            metrics["rep_share"] = metrics["rep_votes"] / metrics["total_dr_votes"]
+
+    if "total_votes" in metrics and "registered_voters" in metrics and metrics["registered_voters"]:
+        metrics["turnout_rate"] = metrics["total_votes"] / metrics["registered_voters"]
+
+    weighted_columns = [
+        "black_cvap_pct",
+        "latino_cvap_pct",
+        "asian_cvap_pct",
+        "white_cvap_pct",
+        "minority_cvap_pct",
+        "turnout_rate",
+        "young_voter_turnout",
+    ]
+    total_overlap_area = overlaps["overlap_area"].sum()
+    for column in weighted_columns:
+        if column not in district_gdf.columns or column in metrics:
+            continue
+        weighted_total = 0.0
+        weight_sum = 0.0
+        for _, overlap_row in overlaps.iterrows():
+            value = safe_numeric(pd.Series([district_gdf.loc[overlap_row["source_index"], column]])).iloc[0]
+            if pd.notna(value):
+                weight = float(overlap_row["overlap_area"]) / total_overlap_area
+                weighted_total += float(value) * weight
+                weight_sum += weight
+        if weight_sum:
+            metrics[column] = weighted_total / weight_sum
+
+    if "dem_share" in metrics and "rep_share" in metrics:
+        winner = "Democratic" if metrics["dem_share"] >= metrics["rep_share"] else "Republican"
+        metrics["winner"] = winner
+        metrics["vote_margin"] = abs(metrics["dem_share"] - metrics["rep_share"])
+
+    display_columns = [
+        "dem_share",
+        "minority_cvap_pct",
+        "turnout_rate",
+        "young_voter_turnout",
+    ]
+    for column in display_columns:
+        if column in district_gdf.columns:
+            overlaps[column] = overlaps["source_index"].map(lambda idx: district_gdf.loc[idx, column])
+
+    overlaps = overlaps.drop(columns=["source_index"])
+    return metrics, overlaps
+
+
+def create_hypothetical_draw_map(
+    district_gdf: gpd.GeoDataFrame,
+    state_name: str,
+    simplify: bool,
+) -> folium.Map:
+    """Build a map with current districts and drawing tools."""
+    config = STATE_CONFIG[state_name]
+    map_object = folium.Map(
+        location=config["center"],
+        zoom_start=config["zoom"],
+        tiles="cartodbdark_matter",
+        control_scale=True,
+    )
+    overlay = prepare_map_gdf(district_gdf, None, simplify, [])
+    if not overlay.empty:
+        folium.GeoJson(
+            data=geojson_dict(overlay),
+            name="Current Congressional Districts",
+            interactive=False,
+            style_function=lambda _: {
+                "fillOpacity": 0.08,
+                "fillColor": "#38bdf8",
+                "color": "#f8fafc",
+                "weight": 1.4,
+                "opacity": 0.85,
+            },
+        ).add_to(map_object)
+
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": {
+                "allowIntersection": False,
+                "showArea": True,
+                "shapeOptions": {"color": "#facc15", "fillColor": "#facc15", "fillOpacity": 0.22},
+            },
+            "rectangle": {
+                "showArea": True,
+                "shapeOptions": {"color": "#facc15", "fillColor": "#facc15", "fillOpacity": 0.22},
+            },
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(map_object)
+    folium.LayerControl(collapsed=True).add_to(map_object)
+    return map_object
+
+
+def format_overlap_table(overlaps: pd.DataFrame) -> pd.DataFrame:
+    """Format current-district overlap rows for display."""
+    if overlaps.empty:
+        return pd.DataFrame()
+    table = overlaps.copy()
+    return pd.DataFrame(
+        {
+            "Current district": table["district"],
+            "Share of proposed": table["share_of_proposed"].map(format_percent),
+            "Share of current district": table["share_of_current_district"].map(format_percent),
+            "Current D share": table.get("dem_share", pd.Series(np.nan, index=table.index)).map(format_percent),
+            "Current minority CVAP": table.get("minority_cvap_pct", pd.Series(np.nan, index=table.index)).map(format_percent),
+            "Current turnout": table.get("turnout_rate", pd.Series(np.nan, index=table.index)).map(format_percent),
+            "Current young turnout": table.get("young_voter_turnout", pd.Series(np.nan, index=table.index)).map(format_percent),
+        }
+    )
+
+
+def display_hypothetical_metrics(metrics: dict[str, Any], overlaps: pd.DataFrame) -> None:
+    """Show estimated metrics for a proposed district."""
+    winner = metrics.get("winner", "Not available")
+    profile_columns = st.columns(5)
+    profile_columns[0].metric("Estimated Winner", winner)
+    profile_columns[1].metric("D/R Margin", format_percentage_points(metrics.get("vote_margin")))
+    profile_columns[2].metric("Democratic Share", format_percent(metrics.get("dem_share")))
+    profile_columns[3].metric("Minority CVAP", format_percent(metrics.get("minority_cvap_pct")))
+    profile_columns[4].metric("Coverage", format_percent(metrics.get("coverage_pct")))
+
+    detail_columns = st.columns(5)
+    detail_columns[0].metric("D + R Votes", format_number(metrics.get("total_dr_votes")))
+    detail_columns[1].metric("Overall Turnout", format_percent(metrics.get("turnout_rate")))
+    detail_columns[2].metric("Young Turnout", format_percent(metrics.get("young_voter_turnout")))
+    detail_columns[3].metric("Current Districts", format_number(metrics.get("intersecting_districts")))
+    detail_columns[4].metric("Registered Voters", format_number(metrics.get("registered_voters")))
+
+    if safe_numeric(pd.Series([metrics.get("coverage_pct")])).iloc[0] < 0.98:
+        st.warning("The proposed shape extends outside the current district layer, so the estimate uses only covered area.")
+
+    overlap_table = format_overlap_table(overlaps)
+    if not overlap_table.empty:
+        st.dataframe(overlap_table, hide_index=True, use_container_width=True)
+
+
+def display_hypothetical_district_tool(
+    district_gdf: gpd.GeoDataFrame,
+    state_name: str,
+    simplify: bool,
+) -> None:
+    """Let users draw or upload a proposed district and estimate its metrics."""
+    if district_gdf is None or district_gdf.empty:
+        return
+
+    st.subheader("Hypothetical District Tool")
+    st.caption(
+        "Draw a proposed district or upload GeoJSON. Estimates are approximate and area-weighted from current districts."
+    )
+
+    session_key = f"{state_name}_hypothetical_drawn_feature"
+    if st.button("Clear proposed district", key=f"{state_name}_clear_hypothetical"):
+        st.session_state.pop(session_key, None)
+
+    draw_map = create_hypothetical_draw_map(district_gdf, state_name, simplify)
+    draw_output = st_folium(
+        draw_map,
+        height=520,
+        use_container_width=True,
+        returned_objects=["last_active_drawing", "all_drawings"],
+        key=f"{state_name}_hypothetical_draw_map",
+    )
+    drawn_geometry = latest_drawn_geometry(draw_output, session_key)
+
+    uploaded_file = st.file_uploader(
+        "Upload proposed district GeoJSON",
+        type=["geojson", "json"],
+        key=f"{state_name}_hypothetical_geojson_upload",
+    )
+    uploaded_geometry = uploaded_geojson_geometry(uploaded_file)
+    if uploaded_file is not None and uploaded_geometry is None:
+        st.warning("The uploaded file could not be read as GeoJSON geometry.")
+
+    proposed_geometry = uploaded_geometry if uploaded_geometry is not None else drawn_geometry
+    if proposed_geometry is None:
+        st.info("Draw a polygon or rectangle on the map to estimate a new district.")
+        return
+
+    metrics, overlaps = estimate_hypothetical_district(district_gdf, proposed_geometry)
+    if not metrics or overlaps.empty:
+        st.warning("The proposed district does not overlap the current district layer.")
+        return
+    display_hypothetical_metrics(metrics, overlaps)
+
+
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
     """Draw the requested top-10 bar charts."""
     detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
@@ -2758,6 +3084,7 @@ def main() -> None:
 
     if geography == "Congressional Districts":
         display_district_scorecard(active_gdf, state_name)
+        display_hypothetical_district_tool(active_gdf, state_name, simplify)
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
