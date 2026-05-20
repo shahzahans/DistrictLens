@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 hypothetical-district-tool"
+APP_VERSION = "2026-05-20 redistricting-metrics"
 
 STATE_CONFIG = {
     "California": {
@@ -94,6 +94,12 @@ LAYER_DEFINITIONS = [
         "description": "Democratic plus Republican votes. This is not total population.",
     },
     {
+        "category": "Votes",
+        "label": "Winner margin",
+        "column": "winner_margin",
+        "description": "Absolute two-party winner margin. Lower values are more competitive; higher values are safer.",
+    },
+    {
         "category": "Turnout",
         "label": "Overall turnout",
         "column": "turnout_rate",
@@ -135,6 +141,24 @@ LAYER_DEFINITIONS = [
         "column": "minority_cvap_pct",
         "description": "Non-white CVAP share, calculated as one minus White CVAP share.",
     },
+    {
+        "category": "Redistricting metrics",
+        "label": "Compactness",
+        "column": "compactness_polsby_popper",
+        "description": "Polsby-Popper compactness score from 0 to 1. Higher values are more compact.",
+    },
+    {
+        "category": "Redistricting metrics",
+        "label": "District area",
+        "column": "district_area_sq_mi",
+        "description": "Estimated district area in square miles, calculated from projected geometry.",
+    },
+    {
+        "category": "Redistricting metrics",
+        "label": "District perimeter",
+        "column": "district_perimeter_mi",
+        "description": "Estimated district perimeter in miles, calculated from projected geometry.",
+    },
 ]
 LAYER_OPTIONS = [(layer["label"], layer["column"]) for layer in LAYER_DEFINITIONS]
 LAYER_BY_COLUMN = {layer["column"]: layer for layer in LAYER_DEFINITIONS}
@@ -142,6 +166,7 @@ LAYER_BY_COLUMN = {layer["column"]: layer for layer in LAYER_DEFINITIONS}
 PERCENT_COLUMNS = {
     "dem_share",
     "rep_share",
+    "winner_margin",
     "turnout_rate",
     "black_cvap_pct",
     "latino_cvap_pct",
@@ -321,6 +346,27 @@ def format_competitiveness_score(value: Any) -> str:
     if pd.isna(number):
         return "Not available"
     return f"{number:.0f}/100"
+
+
+def format_decimal_score(value: Any) -> str:
+    number = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number:.3f}"
+
+
+def format_square_miles(value: Any) -> str:
+    number = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number:,.0f} sq mi"
+
+
+def format_miles(value: Any) -> str:
+    number = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number:,.0f} mi"
 
 
 def format_district_label(value: Any) -> str:
@@ -1444,6 +1490,8 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
             spread = 0.05 if vmin == 0 else max(0.02, abs(vmin) * 0.08)
             vmin = max(0, vmin - spread)
             vmax = min(1, vmax + spread)
+    elif layer_column == "compactness_polsby_popper":
+        vmin, vmax = 0, 1
     elif layer_column in PERCENT_COLUMNS:
         vmin, vmax = 0, 1
     else:
@@ -1457,6 +1505,8 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     if layer_column in {"dem_share", "rep_share"}:
         tick_labels = [0, 0.5, 1]
     elif layer_column in {"turnout_rate", "young_voter_turnout"}:
+        tick_labels = [0, 0.5, 1]
+    elif layer_column == "compactness_polsby_popper":
         tick_labels = [0, 0.5, 1]
     elif layer_column in PERCENT_COLUMNS:
         tick_labels = [0, 0.5, 1]
@@ -1495,6 +1545,33 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     elif layer_column == "turnout_rate":
         color_map = cm.LinearColormap(
             ["#f7fcf5", "#c7e9c0", "#41ab5d", "#00441b"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
+    elif layer_column == "winner_margin":
+        color_map = cm.LinearColormap(
+            ["#ffffcc", "#fdae61", "#d7191c"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
+    elif layer_column == "compactness_polsby_popper":
+        color_map = cm.LinearColormap(
+            ["#f7fcf5", "#c7e9c0", "#41ab5d", "#00441b"],
+            vmin=vmin,
+            vmax=vmax,
+            tick_labels=tick_labels,
+            max_labels=3,
+            text_color="#f8fafc",
+        )
+    elif layer_column in {"district_area_sq_mi", "district_perimeter_mi"}:
+        color_map = cm.LinearColormap(
+            ["#f7fbff", "#c6dbef", "#6baed6", "#08306b"],
             vmin=vmin,
             vmax=vmax,
             tick_labels=tick_labels,
@@ -1770,6 +1847,14 @@ def legend_title(layer_column: str | None) -> str:
         return "Overall turnout"
     if layer_column == "total_dr_votes":
         return "D + R votes"
+    if layer_column == "winner_margin":
+        return "Winner margin"
+    if layer_column == "compactness_polsby_popper":
+        return "Compactness"
+    if layer_column == "district_area_sq_mi":
+        return "District area"
+    if layer_column == "district_perimeter_mi":
+        return "District perimeter"
     if layer_column:
         return LAYER_BY_COLUMN.get(layer_column, {}).get("label", layer_column)
     return "Scale"
@@ -1781,6 +1866,10 @@ def legend_formatter_script(layer_column: str | None) -> str:
         mode = "percent"
     elif layer_column == "total_dr_votes":
         mode = "votes"
+    elif layer_column == "district_area_sq_mi":
+        mode = "sq_mi"
+    elif layer_column == "district_perimeter_mi":
+        mode = "miles"
     else:
         mode = ""
     title = json.dumps(legend_title(layer_column))
@@ -1828,6 +1917,10 @@ def legend_formatter_script(layer_column: str | None) -> str:
                     label.textContent = value >= 1000000
                         ? (value / 1000000).toFixed(1) + "M"
                         : Math.round(value / 1000) + "k";
+                }} else if ("{mode}" === "sq_mi") {{
+                    label.textContent = Math.round(value).toLocaleString() + " sq mi";
+                }} else if ("{mode}" === "miles") {{
+                    label.textContent = Math.round(value).toLocaleString() + " mi";
                 }}
             }});
         }}
@@ -1954,6 +2047,7 @@ def format_tooltip_fields(
         ("D + R votes", "total_dr_votes", "number"),
         ("Democratic share", "dem_share", "percent"),
         ("Republican share", "rep_share", "percent"),
+        ("Winner margin", "winner_margin", "percent"),
         ("Overall turnout", "turnout_rate", "percent"),
         ("Black CVAP", "black_cvap_pct", "percent"),
         ("Latino CVAP", "latino_cvap_pct", "percent"),
@@ -1961,6 +2055,11 @@ def format_tooltip_fields(
         ("White CVAP", "white_cvap_pct", "percent"),
         ("Minority CVAP", "minority_cvap_pct", "percent"),
         ("Young turnout", "young_voter_turnout", "percent"),
+        ("Compactness", "compactness_polsby_popper", "score"),
+        ("Area", "district_area_sq_mi", "sq_mi"),
+        ("Perimeter", "district_perimeter_mi", "miles"),
+        ("Competitiveness", "competitiveness_label", "text"),
+        ("CVAP status", "majority_minority_status", "text"),
     ]
 
     for alias, source_col, kind in standard_specs:
@@ -1970,6 +2069,16 @@ def format_tooltip_fields(
             values = formatted_gdf[source_col].map(format_number)
         elif kind == "percent":
             values = formatted_gdf[source_col].map(format_percent)
+        elif kind == "score":
+            values = formatted_gdf[source_col].map(format_decimal_score)
+        elif kind == "sq_mi":
+            values = formatted_gdf[source_col].map(format_square_miles)
+        elif kind == "miles":
+            values = formatted_gdf[source_col].map(format_miles)
+        elif kind == "text":
+            values = formatted_gdf[source_col].map(
+                lambda value: "Not available" if pd.isna(value) else str(value)
+            )
         else:
             values = formatted_gdf[source_col].map(
                 lambda value: "Not available" if pd.isna(value) else str(value)
@@ -2297,6 +2406,7 @@ def save_outputs(state_name: str, state_data: dict[str, Any]) -> list[str]:
                 "total_dr_votes",
                 "dem_share",
                 "rep_share",
+                "winner_margin",
                 "turnout_rate",
                 "black_cvap_pct",
                 "latino_cvap_pct",
@@ -2304,6 +2414,11 @@ def save_outputs(state_name: str, state_data: dict[str, Any]) -> list[str]:
                 "white_cvap_pct",
                 "minority_cvap_pct",
                 "young_voter_turnout",
+                "compactness_polsby_popper",
+                "district_area_sq_mi",
+                "district_perimeter_mi",
+                "competitiveness_label",
+                "majority_minority_status",
             ]
             if column in gdf.columns
         ]
@@ -2581,6 +2696,50 @@ def projected_area_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf.to_crs(5070)
 
 
+def majority_minority_status(value: Any) -> str:
+    minority_share = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(minority_share):
+        return "CVAP status unknown"
+    if minority_share >= 0.50:
+        return "Majority-minority CVAP"
+    if minority_share >= 0.40:
+        return "Near majority-minority CVAP"
+    return "Majority white CVAP"
+
+
+def add_redistricting_metrics(gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+    """Add geometry, competitiveness, and representation metrics to districts."""
+    if gdf is None or gdf.empty or "geometry" not in gdf.columns:
+        return gdf
+
+    enriched = gdf.copy()
+    try:
+        projected = projected_area_gdf(enriched)
+        area_sq_meters = projected.geometry.area.replace(0, np.nan)
+        perimeter_meters = projected.geometry.length.replace(0, np.nan)
+    except Exception:
+        return enriched
+
+    enriched["district_area_sq_mi"] = area_sq_meters / 2_589_988.110336
+    enriched["district_perimeter_mi"] = perimeter_meters / 1_609.344
+    enriched["compactness_polsby_popper"] = (
+        4 * np.pi * area_sq_meters / (perimeter_meters ** 2)
+    ).clip(lower=0, upper=1)
+
+    if {"dem_share", "rep_share"}.issubset(enriched.columns):
+        dem_share = safe_numeric(enriched["dem_share"])
+        rep_share = safe_numeric(enriched["rep_share"])
+        enriched["winner_margin"] = (dem_share - rep_share).abs()
+        enriched["competitiveness_label"] = enriched["winner_margin"].map(competitiveness_label)
+
+    if "minority_cvap_pct" in enriched.columns:
+        minority_share = safe_numeric(enriched["minority_cvap_pct"])
+        enriched["majority_minority_flag"] = (minority_share >= 0.50).astype(float)
+        enriched["majority_minority_status"] = enriched["minority_cvap_pct"].map(majority_minority_status)
+
+    return enriched
+
+
 def estimate_hypothetical_district(
     district_gdf: gpd.GeoDataFrame,
     proposed_geometry: Any,
@@ -2847,6 +3006,80 @@ def display_hypothetical_district_tool(
     display_hypothetical_metrics(metrics, overlaps)
 
 
+def redistricting_metrics_table(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Return a formatted district-level redistricting metrics table."""
+    if gdf is None or gdf.empty:
+        return pd.DataFrame()
+
+    attrs = gdf.drop(columns="geometry", errors="ignore").copy()
+    id_column = district_id_column(gdf)
+    district_values = attrs[id_column] if id_column in attrs.columns else pd.Series(attrs.index, index=attrs.index)
+    table = pd.DataFrame(
+        {
+            "District": district_values.map(format_district_label),
+            "Competitiveness": attrs.get("competitiveness_label", pd.Series("Not available", index=attrs.index)),
+            "Winner margin": attrs.get("winner_margin", pd.Series(np.nan, index=attrs.index)).map(format_percent),
+            "CVAP status": attrs.get("majority_minority_status", pd.Series("Not available", index=attrs.index)),
+            "Minority CVAP": attrs.get("minority_cvap_pct", pd.Series(np.nan, index=attrs.index)).map(format_percent),
+            "Compactness": attrs.get("compactness_polsby_popper", pd.Series(np.nan, index=attrs.index)).map(format_decimal_score),
+            "Area": attrs.get("district_area_sq_mi", pd.Series(np.nan, index=attrs.index)).map(format_square_miles),
+            "Perimeter": attrs.get("district_perimeter_mi", pd.Series(np.nan, index=attrs.index)).map(format_miles),
+        }
+    )
+
+    sort_values = safe_numeric(attrs.get("compactness_polsby_popper", pd.Series(np.nan, index=attrs.index)))
+    table["_compactness_sort"] = sort_values
+    table = table.sort_values(
+        ["_compactness_sort", "District"],
+        ascending=[True, True],
+        key=lambda series: series.map(natural_sort_key) if series.name == "District" else series,
+        na_position="last",
+    )
+    return table.drop(columns="_compactness_sort")
+
+
+def district_name_from_row(row: pd.Series, gdf: gpd.GeoDataFrame) -> str:
+    id_column = district_id_column(gdf)
+    if id_column in row.index:
+        return format_district_label(row[id_column])
+    return format_district_label(row.name)
+
+
+def display_redistricting_metrics(gdf: gpd.GeoDataFrame) -> None:
+    """Show compactness, representation, and competitiveness metrics."""
+    st.subheader("Redistricting Metrics")
+
+    compactness = safe_numeric(gdf.get("compactness_polsby_popper", pd.Series(dtype="float64")))
+    winner_margin = safe_numeric(gdf.get("winner_margin", pd.Series(dtype="float64")))
+    minority_cvap = safe_numeric(gdf.get("minority_cvap_pct", pd.Series(dtype="float64")))
+
+    valid_compactness = compactness.dropna()
+    most_compact = "Not available"
+    least_compact = "Not available"
+    if not valid_compactness.empty:
+        most_row = gdf.loc[valid_compactness.idxmax()]
+        least_row = gdf.loc[valid_compactness.idxmin()]
+        most_compact = district_name_from_row(most_row, gdf)
+        least_compact = district_name_from_row(least_row, gdf)
+
+    metrics_columns = st.columns(5)
+    metrics_columns[0].metric("Average Compactness", format_decimal_score(valid_compactness.mean()))
+    metrics_columns[1].metric("Most Compact", most_compact)
+    metrics_columns[2].metric("Least Compact", least_compact)
+    metrics_columns[3].metric("Majority-Minority Districts", format_number((minority_cvap >= 0.50).sum()))
+    metrics_columns[4].metric("Competitive Districts", format_number((winner_margin <= 0.10).sum()))
+
+    st.caption(
+        "Compactness uses the Polsby-Popper score. Competitive districts are those with a two-party winner margin of 10 percentage points or less."
+    )
+    table = redistricting_metrics_table(gdf)
+    if table.empty:
+        st.info("Redistricting metrics could not be calculated for this district layer.")
+    else:
+        table_height = min(560, 38 * (len(table) + 1))
+        st.dataframe(table, hide_index=True, use_container_width=True, height=table_height)
+
+
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
     """Draw the requested top-10 bar charts."""
     detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
@@ -2924,12 +3157,20 @@ def map_status_text(state_name: str, geography: str, layer_label: str, layer_col
         return f"{base} Darker red means a higher Republican vote share. Hover or click for exact percentages."
     if layer_column == "total_dr_votes":
         return f"{base} Darker colors mean more Democratic plus Republican votes. Hover or click for exact vote totals."
+    if layer_column == "winner_margin":
+        return f"{base} Darker colors mean a larger two-party winner margin. Lighter areas are more competitive."
     if layer_column == "turnout_rate":
         return f"{base} Darker green means higher turnout within this state. Hover or click for the turnout percentage."
     if layer_column and "cvap" in layer_column:
         return f"{base} Darker purple means a higher {layer_label} share. Hover or click for exact CVAP percentages."
     if layer_column == "young_voter_turnout":
         return f"{base} Darker purple means higher young voter turnout within this state. Hover or click for exact percentages."
+    if layer_column == "compactness_polsby_popper":
+        return f"{base} Darker green means a higher Polsby-Popper compactness score."
+    if layer_column == "district_area_sq_mi":
+        return f"{base} Darker blue means a larger estimated district area."
+    if layer_column == "district_perimeter_mi":
+        return f"{base} Darker blue means a longer estimated district perimeter."
     return f"{base} Hover or click a district for available statistics."
 
 
@@ -3017,6 +3258,11 @@ def main() -> None:
             st.json(state_data["debug"])
         return
 
+    if geography == "Congressional Districts":
+        active_gdf = add_redistricting_metrics(active_gdf)
+        district_gdf = active_gdf
+        state_data["districts"] = active_gdf
+
     available_layers = available_layer_definitions(active_gdf)
     with st.sidebar:
         st.markdown("### 5. Map Theme")
@@ -3084,6 +3330,7 @@ def main() -> None:
 
     if geography == "Congressional Districts":
         display_district_scorecard(active_gdf, state_name)
+        display_redistricting_metrics(active_gdf)
         display_hypothetical_district_tool(active_gdf, state_name, simplify)
 
     st.subheader("Charts")

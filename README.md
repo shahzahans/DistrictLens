@@ -60,6 +60,10 @@ Congressional district view includes a district scorecard for California and Lou
 
 Congressional district view also includes a hypothetical district tool. Draw a proposed district on the map or upload a GeoJSON boundary, and the app estimates vote share, turnout, CVAP demographics, and overlap with current districts. Estimates are approximate because they are area-weighted from the current congressional district layer.
 
+## Redistricting Metrics
+
+Congressional district view includes redistricting metrics for compactness, district area, district perimeter, majority-minority CVAP status, and competitiveness. Compactness uses the Polsby-Popper score, where higher values are more compact. Competitive districts are those with a two-party winner margin of 10 percentage points or less.
+
 ## Deploy
 
 This repo is ready for Streamlit Community Cloud:
