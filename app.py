@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 redistricting-metrics"
+APP_VERSION = "2026-05-20 compactness-contrast"
 
 STATE_CONFIG = {
     "California": {
@@ -1491,7 +1491,12 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
             vmin = max(0, vmin - spread)
             vmax = min(1, vmax + spread)
     elif layer_column == "compactness_polsby_popper":
-        vmin, vmax = 0, 1
+        vmin = max(0, float(numeric.quantile(0.05)))
+        vmax = min(1, float(numeric.quantile(0.95)))
+        if vmin == vmax:
+            spread = max(0.02, abs(vmin) * 0.12)
+            vmin = max(0, vmin - spread)
+            vmax = min(1, vmax + spread)
     elif layer_column in PERCENT_COLUMNS:
         vmin, vmax = 0, 1
     else:
@@ -1507,7 +1512,7 @@ def layer_colormap(layer_column: str, values: pd.Series) -> cm.LinearColormap:
     elif layer_column in {"turnout_rate", "young_voter_turnout"}:
         tick_labels = [0, 0.5, 1]
     elif layer_column == "compactness_polsby_popper":
-        tick_labels = [0, 0.5, 1]
+        tick_labels = [round(vmin, 2), round((vmin + vmax) / 2, 2), round(vmax, 2)]
     elif layer_column in PERCENT_COLUMNS:
         tick_labels = [0, 0.5, 1]
     else:
@@ -3166,7 +3171,7 @@ def map_status_text(state_name: str, geography: str, layer_label: str, layer_col
     if layer_column == "young_voter_turnout":
         return f"{base} Darker purple means higher young voter turnout within this state. Hover or click for exact percentages."
     if layer_column == "compactness_polsby_popper":
-        return f"{base} Darker green means a higher Polsby-Popper compactness score."
+        return f"{base} Darker green means a higher Polsby-Popper compactness score within this state."
     if layer_column == "district_area_sq_mi":
         return f"{base} Darker blue means a larger estimated district area."
     if layer_column == "district_perimeter_mi":
