@@ -56,9 +56,9 @@ The dashboard opens in your browser. Use the sidebar to choose a state, geograph
 
 Congressional district view includes a district scorecard for California and Louisiana. Select a district to see the vote winner, D/R margin, competitive rank, minority CVAP share, and young turnout. The ranking table can sort districts by competitiveness, minority CVAP share, young turnout, overall turnout, Democratic margin, Republican margin, winner margin, or D + R votes.
 
-## Hypothetical District Tool
+## Proposed Plan Mode
 
-Congressional district view also includes a hypothetical district tool. Draw a proposed district on the map or upload a GeoJSON boundary, and the app estimates vote share, turnout, CVAP demographics, and overlap with current districts. Estimates are approximate because they are area-weighted from the current congressional district layer.
+Congressional district view also includes proposed plan mode. Draw multiple proposed districts or upload a GeoJSON FeatureCollection, and the app estimates vote share, turnout, CVAP demographics, compactness, and overlap with current districts. The plan summary compares estimated outcomes against the current plan, including seats, competitiveness, majority-minority CVAP districts, compactness, and turnout. Estimates are approximate because they are area-weighted from the current congressional district layer.
 
 ## Redistricting Metrics
 

@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 state-comparison"
+APP_VERSION = "2026-05-20 proposed-plan-mode"
 
 STATE_CONFIG = {
     "California": {
@@ -2645,24 +2645,65 @@ def display_district_scorecard(gdf: gpd.GeoDataFrame, state_name: str) -> None:
         st.dataframe(ranking_table, hide_index=True, use_container_width=True, height=table_height)
 
 
-def geometry_from_geojson(data: dict[str, Any]) -> Any | None:
-    """Return a single shapely geometry from a GeoJSON object."""
+def geojson_feature_label(feature: dict[str, Any], index: int) -> str:
+    """Choose a useful display label for a proposed district GeoJSON feature."""
+    properties = feature.get("properties") or {}
+    for key in ["district", "DISTRICT", "DISTRICT_I", "CD119", "BASENAME", "name", "NAME", "id", "ID"]:
+        value = properties.get(key)
+        if value not in [None, ""]:
+            return format_district_label(value)
+    feature_id = feature.get("id")
+    if feature_id not in [None, ""]:
+        return format_district_label(feature_id)
+    return f"Proposed {index}"
+
+
+def proposed_geometries_from_geojson(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return labeled proposed district geometries from GeoJSON."""
+    proposed: list[dict[str, Any]] = []
     try:
         if data.get("type") == "FeatureCollection":
-            geometries = [
-                shape(feature["geometry"])
-                for feature in data.get("features", [])
-                if feature.get("geometry")
-            ]
-            geometries = [geometry for geometry in geometries if not geometry.is_empty]
-            return unary_union(geometries) if geometries else None
+            for index, feature in enumerate(data.get("features", []), start=1):
+                if not feature.get("geometry"):
+                    continue
+                geometry = shape(feature["geometry"])
+                if geometry.is_empty:
+                    continue
+                proposed.append(
+                    {
+                        "label": geojson_feature_label(feature, index),
+                        "geometry": geometry,
+                        "properties": feature.get("properties") or {},
+                    }
+                )
+            return proposed
         if data.get("type") == "Feature":
-            return shape(data["geometry"]) if data.get("geometry") else None
+            if data.get("geometry"):
+                geometry = shape(data["geometry"])
+                if not geometry.is_empty:
+                    proposed.append(
+                        {
+                            "label": geojson_feature_label(data, 1),
+                            "geometry": geometry,
+                            "properties": data.get("properties") or {},
+                        }
+                    )
+            return proposed
         if data.get("type"):
-            return shape(data)
+            geometry = shape(data)
+            if not geometry.is_empty:
+                proposed.append({"label": "Proposed 1", "geometry": geometry, "properties": {}})
     except (KeyError, TypeError, ValueError):
+        return []
+    return proposed
+
+
+def geometry_from_geojson(data: dict[str, Any]) -> Any | None:
+    """Return a single shapely geometry from a GeoJSON object."""
+    geometries = [item["geometry"] for item in proposed_geometries_from_geojson(data)]
+    if not geometries:
         return None
-    return None
+    return unary_union(geometries)
 
 
 def latest_drawn_geometry(draw_output: dict[str, Any] | None, session_key: str) -> Any | None:
@@ -2683,6 +2724,20 @@ def latest_drawn_geometry(draw_output: dict[str, Any] | None, session_key: str) 
     return geometry_from_geojson(st.session_state.get(session_key, {}))
 
 
+def drawn_plan_geometries(draw_output: dict[str, Any] | None, session_key: str) -> list[dict[str, Any]]:
+    """Get all drawn proposed districts from streamlit-folium."""
+    if draw_output and draw_output.get("all_drawings"):
+        st.session_state[session_key] = draw_output["all_drawings"]
+
+    drawings = st.session_state.get(session_key, [])
+    proposed = []
+    for index, drawing in enumerate(drawings, start=1):
+        for item in proposed_geometries_from_geojson(drawing):
+            item["label"] = f"Drawn {index}"
+            proposed.append(item)
+    return proposed
+
+
 def uploaded_geojson_geometry(uploaded_file: Any) -> Any | None:
     """Read a Streamlit uploaded GeoJSON file into one shapely geometry."""
     if uploaded_file is None:
@@ -2692,6 +2747,17 @@ def uploaded_geojson_geometry(uploaded_file: Any) -> Any | None:
     except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return geometry_from_geojson(data)
+
+
+def uploaded_geojson_plan(uploaded_file: Any) -> list[dict[str, Any]]:
+    """Read a Streamlit uploaded GeoJSON file into labeled proposed districts."""
+    if uploaded_file is None:
+        return []
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8-sig"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    return proposed_geometries_from_geojson(data)
 
 
 def projected_area_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -2919,6 +2985,77 @@ def create_hypothetical_draw_map(
     return map_object
 
 
+def proposed_geometry_metrics(geometry: Any) -> dict[str, Any]:
+    """Calculate area, perimeter, and compactness for one proposed district geometry."""
+    if geometry is None or geometry.is_empty:
+        return {}
+    proposed_gdf = gpd.GeoDataFrame({"geometry": [geometry]}, crs=4326)
+    try:
+        projected = projected_area_gdf(proposed_gdf)
+        projected_geometry = projected.geometry.iloc[0]
+        if not projected_geometry.is_valid:
+            projected_geometry = projected_geometry.buffer(0)
+        area_sq_meters = projected_geometry.area
+        perimeter_meters = projected_geometry.length
+    except Exception:
+        return {}
+    if area_sq_meters <= 0 or perimeter_meters <= 0:
+        return {}
+    return {
+        "district_area_sq_mi": area_sq_meters / 2_589_988.110336,
+        "district_perimeter_mi": perimeter_meters / 1_609.344,
+        "compactness_polsby_popper": max(
+            0.0,
+            min(1.0, 4 * np.pi * area_sq_meters / (perimeter_meters ** 2)),
+        ),
+    }
+
+
+def proposed_plan_geojson(proposed_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Serialize proposed plan geometries for Folium display."""
+    if not proposed_items:
+        return {"type": "FeatureCollection", "features": []}
+    proposed_gdf = gpd.GeoDataFrame(
+        {
+            "proposal_label": [item["label"] for item in proposed_items],
+            "geometry": [item["geometry"] for item in proposed_items],
+        },
+        crs=4326,
+    )
+    return geojson_dict(proposed_gdf)
+
+
+def add_proposed_plan_overlay(map_object: folium.Map, proposed_items: list[dict[str, Any]]) -> None:
+    """Draw proposed districts on top of a plan map."""
+    if not proposed_items:
+        return
+    folium.GeoJson(
+        data=proposed_plan_geojson(proposed_items),
+        name="Proposed Plan",
+        tooltip=folium.GeoJsonTooltip(fields=["proposal_label"], aliases=["Proposed district"]),
+        style_function=lambda _: {
+            "fillColor": "#facc15",
+            "color": "#facc15",
+            "weight": 2.4,
+            "fillOpacity": 0.22,
+            "opacity": 0.95,
+        },
+        highlight_function=lambda _: {"weight": 3.4, "color": "#fef08a", "fillOpacity": 0.32},
+    ).add_to(map_object)
+
+
+def create_proposed_plan_map(
+    district_gdf: gpd.GeoDataFrame,
+    state_name: str,
+    simplify: bool,
+    proposed_items: list[dict[str, Any]] | None = None,
+) -> folium.Map:
+    """Build a map for drawing or viewing a proposed district plan."""
+    map_object = create_hypothetical_draw_map(district_gdf, state_name, simplify)
+    add_proposed_plan_overlay(map_object, proposed_items or [])
+    return map_object
+
+
 def format_overlap_table(overlaps: pd.DataFrame) -> pd.DataFrame:
     """Format current-district overlap rows for display."""
     if overlaps.empty:
@@ -3009,6 +3146,243 @@ def display_hypothetical_district_tool(
         st.warning("The proposed district does not overlap the current district layer.")
         return
     display_hypothetical_metrics(metrics, overlaps)
+
+
+def estimate_proposed_plan(
+    district_gdf: gpd.GeoDataFrame,
+    proposed_items: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """Estimate metrics for each proposed district in a proposed plan."""
+    rows = []
+    for index, item in enumerate(proposed_items, start=1):
+        metrics, _overlaps = estimate_hypothetical_district(district_gdf, item.get("geometry"))
+        if not metrics:
+            continue
+        geometry_metrics = proposed_geometry_metrics(item.get("geometry"))
+        label = item.get("label") or f"Proposed {index}"
+        dem_share = safe_numeric(pd.Series([metrics.get("dem_share")])).iloc[0]
+        rep_share = safe_numeric(pd.Series([metrics.get("rep_share")])).iloc[0]
+        if pd.isna(dem_share) or pd.isna(rep_share):
+            winner = "Not available"
+        else:
+            winner = "Democratic" if dem_share >= rep_share else "Republican"
+        rows.append(
+            {
+                "Proposed district": label,
+                "Estimated winner": winner,
+                "Winner margin": safe_numeric(pd.Series([metrics.get("vote_margin")])).iloc[0],
+                "Democratic share": dem_share,
+                "Republican share": rep_share,
+                "D + R votes": safe_numeric(pd.Series([metrics.get("total_dr_votes")])).iloc[0],
+                "Turnout": safe_numeric(pd.Series([metrics.get("turnout_rate")])).iloc[0],
+                "Young turnout": safe_numeric(pd.Series([metrics.get("young_voter_turnout")])).iloc[0],
+                "Minority CVAP": safe_numeric(pd.Series([metrics.get("minority_cvap_pct")])).iloc[0],
+                "Black CVAP": safe_numeric(pd.Series([metrics.get("black_cvap_pct")])).iloc[0],
+                "Latino CVAP": safe_numeric(pd.Series([metrics.get("latino_cvap_pct")])).iloc[0],
+                "Coverage": safe_numeric(pd.Series([metrics.get("coverage_pct")])).iloc[0],
+                "Current districts touched": safe_numeric(pd.Series([metrics.get("intersecting_districts")])).iloc[0],
+                "Area": safe_numeric(pd.Series([geometry_metrics.get("district_area_sq_mi")])).iloc[0],
+                "Perimeter": safe_numeric(pd.Series([geometry_metrics.get("district_perimeter_mi")])).iloc[0],
+                "Compactness": safe_numeric(pd.Series([geometry_metrics.get("compactness_polsby_popper")])).iloc[0],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def current_plan_outcome_metrics(district_gdf: gpd.GeoDataFrame) -> dict[str, Any]:
+    """Create raw outcome metrics for the current district plan."""
+    dem_share = safe_numeric(district_gdf.get("dem_share", pd.Series(dtype="float64")))
+    rep_share = safe_numeric(district_gdf.get("rep_share", pd.Series(dtype="float64")))
+    winner_margin = safe_numeric(district_gdf.get("winner_margin", (dem_share - rep_share).abs()))
+    minority_cvap = safe_numeric(district_gdf.get("minority_cvap_pct", pd.Series(dtype="float64")))
+    compactness = safe_numeric(district_gdf.get("compactness_polsby_popper", pd.Series(dtype="float64")))
+    turnout = safe_numeric(district_gdf.get("turnout_rate", pd.Series(dtype="float64")))
+    young_turnout = safe_numeric(district_gdf.get("young_voter_turnout", pd.Series(dtype="float64")))
+    dem_votes = safe_numeric(district_gdf.get("dem_votes", pd.Series(dtype="float64"))).sum()
+    rep_votes = safe_numeric(district_gdf.get("rep_votes", pd.Series(dtype="float64"))).sum()
+    total_votes = dem_votes + rep_votes
+    return {
+        "district_count": len(district_gdf),
+        "democratic_seats": ((dem_share >= rep_share) & dem_share.notna() & rep_share.notna()).sum(),
+        "republican_seats": ((rep_share > dem_share) & dem_share.notna() & rep_share.notna()).sum(),
+        "competitive_districts": (winner_margin <= 0.10).sum(),
+        "majority_minority_districts": (minority_cvap >= 0.50).sum(),
+        "average_compactness": compactness.mean(),
+        "average_minority_cvap": minority_cvap.mean(),
+        "average_turnout": turnout.mean(),
+        "average_young_turnout": young_turnout.mean(),
+        "democratic_share": dem_votes / total_votes if total_votes else np.nan,
+    }
+
+
+def proposed_plan_outcome_metrics(estimates: pd.DataFrame) -> dict[str, Any]:
+    """Create raw outcome metrics for a proposed district plan."""
+    if estimates.empty:
+        return {}
+    dem_votes = safe_numeric(estimates.get("Democratic share", pd.Series(dtype="float64"))) * safe_numeric(
+        estimates.get("D + R votes", pd.Series(dtype="float64"))
+    )
+    rep_votes = safe_numeric(estimates.get("Republican share", pd.Series(dtype="float64"))) * safe_numeric(
+        estimates.get("D + R votes", pd.Series(dtype="float64"))
+    )
+    total_votes = dem_votes.sum() + rep_votes.sum()
+    return {
+        "district_count": len(estimates),
+        "democratic_seats": (estimates["Estimated winner"] == "Democratic").sum(),
+        "republican_seats": (estimates["Estimated winner"] == "Republican").sum(),
+        "competitive_districts": (safe_numeric(estimates["Winner margin"]) <= 0.10).sum(),
+        "majority_minority_districts": (safe_numeric(estimates["Minority CVAP"]) >= 0.50).sum(),
+        "average_compactness": safe_numeric(estimates["Compactness"]).mean(),
+        "average_minority_cvap": safe_numeric(estimates["Minority CVAP"]).mean(),
+        "average_turnout": safe_numeric(estimates["Turnout"]).mean(),
+        "average_young_turnout": safe_numeric(estimates["Young turnout"]).mean(),
+        "democratic_share": dem_votes.sum() / total_votes if total_votes else np.nan,
+    }
+
+
+def format_signed_number_delta(delta: Any) -> str:
+    number = safe_numeric(pd.Series([delta])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number:+,.0f}"
+
+
+def format_signed_percent_delta(delta: Any) -> str:
+    number = safe_numeric(pd.Series([delta])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number * 100:+.1f} pp"
+
+
+def format_signed_score_delta(delta: Any) -> str:
+    number = safe_numeric(pd.Series([delta])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number:+.3f}"
+
+
+def proposed_plan_summary_table(district_gdf: gpd.GeoDataFrame, estimates: pd.DataFrame) -> pd.DataFrame:
+    """Format a current-vs-proposed plan comparison table."""
+    current = current_plan_outcome_metrics(district_gdf)
+    proposed = proposed_plan_outcome_metrics(estimates)
+    specs = [
+        ("District count", "district_count", format_number, format_signed_number_delta),
+        ("Estimated Democratic seats", "democratic_seats", format_number, format_signed_number_delta),
+        ("Estimated Republican seats", "republican_seats", format_number, format_signed_number_delta),
+        ("Competitive districts", "competitive_districts", format_number, format_signed_number_delta),
+        ("Majority-minority CVAP districts", "majority_minority_districts", format_number, format_signed_number_delta),
+        ("Average compactness", "average_compactness", format_decimal_score, format_signed_score_delta),
+        ("Average minority CVAP", "average_minority_cvap", format_percent, format_signed_percent_delta),
+        ("Average turnout", "average_turnout", format_percent, format_signed_percent_delta),
+        ("Average young turnout", "average_young_turnout", format_percent, format_signed_percent_delta),
+        ("Estimated Democratic vote share", "democratic_share", format_percent, format_signed_percent_delta),
+    ]
+    rows = []
+    for label, key, formatter, delta_formatter in specs:
+        current_value = current.get(key)
+        proposed_value = proposed.get(key)
+        rows.append(
+            {
+                "Metric": label,
+                "Current plan": formatter(current_value),
+                "Proposed plan": formatter(proposed_value),
+                "Difference": delta_formatter(safe_numeric(pd.Series([proposed_value])).iloc[0] - safe_numeric(pd.Series([current_value])).iloc[0]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def proposed_plan_display_table(estimates: pd.DataFrame) -> pd.DataFrame:
+    """Format proposed district estimates for display."""
+    if estimates.empty:
+        return pd.DataFrame()
+    table = estimates.copy()
+    table = table.sort_values("Proposed district", key=lambda series: series.map(natural_sort_key))
+    return pd.DataFrame(
+        {
+            "Proposed district": table["Proposed district"],
+            "Estimated winner": table["Estimated winner"],
+            "Winner margin": table["Winner margin"].map(format_percent),
+            "D share": table["Democratic share"].map(format_percent),
+            "Turnout": table["Turnout"].map(format_percent),
+            "Young turnout": table["Young turnout"].map(format_percent),
+            "Minority CVAP": table["Minority CVAP"].map(format_percent),
+            "Black CVAP": table["Black CVAP"].map(format_percent),
+            "Latino CVAP": table["Latino CVAP"].map(format_percent),
+            "Compactness": table["Compactness"].map(format_decimal_score),
+            "Area": table["Area"].map(format_square_miles),
+            "Coverage": table["Coverage"].map(format_percent),
+            "Current districts touched": table["Current districts touched"].map(format_number),
+            "D + R votes": table["D + R votes"].map(format_number),
+        }
+    )
+
+
+def display_proposed_plan_mode(
+    district_gdf: gpd.GeoDataFrame,
+    state_name: str,
+    simplify: bool,
+) -> None:
+    """Compare a multi-district proposed plan against the current district plan."""
+    if district_gdf is None or district_gdf.empty:
+        return
+
+    st.subheader("Proposed Plan Mode")
+    st.caption(
+        "Draw multiple districts or upload a proposed-plan GeoJSON. The comparison estimates outcomes from current district overlaps."
+    )
+
+    upload_key = f"{state_name}_proposed_plan_geojson_upload"
+    uploaded_file = st.file_uploader(
+        "Upload proposed plan GeoJSON",
+        type=["geojson", "json"],
+        key=upload_key,
+    )
+    uploaded_items = uploaded_geojson_plan(uploaded_file)
+    if uploaded_file is not None and not uploaded_items:
+        st.warning("The uploaded file could not be read as proposed district GeoJSON.")
+
+    session_key = f"{state_name}_proposed_plan_drawings"
+    if st.button("Clear proposed plan drawings", key=f"{state_name}_clear_proposed_plan"):
+        st.session_state.pop(session_key, None)
+
+    draw_map = create_proposed_plan_map(district_gdf, state_name, simplify, uploaded_items)
+    draw_output = st_folium(
+        draw_map,
+        height=560,
+        use_container_width=True,
+        returned_objects=["last_active_drawing", "all_drawings"],
+        key=f"{state_name}_proposed_plan_draw_map",
+    )
+    drawn_items = drawn_plan_geometries(draw_output, session_key)
+    proposed_items = uploaded_items if uploaded_items else drawn_items
+
+    if not proposed_items:
+        st.info("Draw multiple polygons/rectangles or upload a GeoJSON FeatureCollection to compare a proposed plan.")
+        return
+
+    estimates = estimate_proposed_plan(district_gdf, proposed_items)
+    if estimates.empty:
+        st.warning("The proposed plan does not overlap the current district layer.")
+        return
+
+    if len(estimates) != len(district_gdf):
+        st.warning(
+            f"This proposed plan has {len(estimates):,} estimated district(s), while the current plan has "
+            f"{len(district_gdf):,}. The comparison is useful, but it is not a full same-size replacement plan."
+        )
+
+    summary_tab, district_tab = st.tabs(["Plan Outcome Summary", "Proposed Districts"])
+    with summary_tab:
+        st.dataframe(
+            proposed_plan_summary_table(district_gdf, estimates),
+            hide_index=True,
+            use_container_width=True,
+        )
+    with district_tab:
+        display_table = proposed_plan_display_table(estimates)
+        table_height = min(560, 38 * (len(display_table) + 1))
+        st.dataframe(display_table, hide_index=True, use_container_width=True, height=table_height)
 
 
 def redistricting_metrics_table(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
@@ -3520,7 +3894,7 @@ def main() -> None:
         display_district_scorecard(active_gdf, state_name)
         display_redistricting_metrics(active_gdf)
         display_state_comparison()
-        display_hypothetical_district_tool(active_gdf, state_name, simplify)
+        display_proposed_plan_mode(active_gdf, state_name, simplify)
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
