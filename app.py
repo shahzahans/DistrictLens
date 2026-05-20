@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 boundary-edit-mode"
+APP_VERSION = "2026-05-20 editable-boundary-plan"
 
 STATE_CONFIG = {
     "California": {
@@ -2648,7 +2648,7 @@ def display_district_scorecard(gdf: gpd.GeoDataFrame, state_name: str) -> None:
 def geojson_feature_label(feature: dict[str, Any], index: int) -> str:
     """Choose a useful display label for a proposed district GeoJSON feature."""
     properties = feature.get("properties") or {}
-    for key in ["district", "DISTRICT", "DISTRICT_I", "CD119", "BASENAME", "name", "NAME", "id", "ID"]:
+    for key in ["proposal_label", "district", "DISTRICT", "DISTRICT_I", "CD119", "BASENAME", "name", "NAME", "id", "ID"]:
         value = properties.get(key)
         if value not in [None, ""]:
             return format_district_label(value)
@@ -3068,14 +3068,29 @@ def district_label_map(gdf: gpd.GeoDataFrame) -> dict[str, Any]:
     return dict(sorted(labels.items(), key=lambda item: natural_sort_key(item[0])))
 
 
-def current_plan_items(gdf: gpd.GeoDataFrame) -> list[dict[str, Any]]:
-    """Convert current district geometries into proposed-plan item objects."""
+def current_plan_gdf(gdf: gpd.GeoDataFrame, simplify: bool = False) -> gpd.GeoDataFrame:
+    """Convert current district geometries into a labeled GeoDataFrame for proposed-plan tools."""
     labels = district_label_map(gdf)
-    items = []
+    rows = []
     for label, index in labels.items():
         geometry = gdf.loc[index].geometry
         if geometry is None or geometry.is_empty:
             continue
+        rows.append({"proposal_label": label, "geometry": geometry})
+
+    plan_gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=gdf.crs if gdf.crs is not None else 4326)
+    return prepare_map_gdf(plan_gdf, None, simplify, ["proposal_label"])
+
+
+def current_plan_items(gdf: gpd.GeoDataFrame, simplify: bool = False) -> list[dict[str, Any]]:
+    """Convert current district geometries into proposed-plan item objects."""
+    plan_gdf = current_plan_gdf(gdf, simplify)
+    items = []
+    for _, row in plan_gdf.iterrows():
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        label = format_district_label(row.get("proposal_label", len(items) + 1))
         items.append({"label": label, "geometry": geometry, "properties": {"source": "current"}})
     return items
 
@@ -3092,64 +3107,300 @@ def safe_geometry(geometry: Any) -> Any:
     return geometry
 
 
-def boundary_adjusted_plan_items(
-    district_gdf: gpd.GeoDataFrame,
+def geometry_parts(geometry: Any) -> list[Any]:
+    """Return polygon-like parts from a Shapely geometry."""
+    geometry = safe_geometry(geometry)
+    if geometry is None or geometry.is_empty:
+        return []
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        return list(getattr(geometry, "geoms", [geometry]))
+    return [
+        part
+        for part in getattr(geometry, "geoms", [])
+        if part.geom_type in {"Polygon", "MultiPolygon"} and not part.is_empty
+    ]
+
+
+def projected_geometry_area(geometry: Any) -> float:
+    """Measure one geometry in square meters using the app's equal-area projection."""
+    if geometry is None or geometry.is_empty:
+        return 0.0
+    try:
+        projected = projected_area_gdf(gpd.GeoDataFrame({"geometry": [safe_geometry(geometry)]}, crs=4326))
+        projected_geometry = safe_geometry(projected.geometry.iloc[0])
+        return float(projected_geometry.area) if projected_geometry is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def geometry_change_share(reference_geometry: Any, edited_geometry: Any) -> float:
+    """Return how much a geometry changed as a share of its original area."""
+    reference_geometry = safe_geometry(reference_geometry)
+    edited_geometry = safe_geometry(edited_geometry)
+    if reference_geometry is None or edited_geometry is None:
+        return 0.0
+    reference_area = projected_geometry_area(reference_geometry)
+    if reference_area <= 0:
+        return 0.0
+    try:
+        changed_area = projected_geometry_area(reference_geometry.symmetric_difference(edited_geometry))
+    except Exception:
+        return 0.0
+    return changed_area / reference_area
+
+
+def align_edited_items_to_current_labels(
+    edited_items: list[dict[str, Any]],
+    baseline_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep edited browser features attached to the district labels loaded into the edit map."""
+    baseline_labels = [item["label"] for item in baseline_items]
+    baseline_label_set = set(baseline_labels)
+    aligned = []
+    used_labels: set[str] = set()
+    for index, item in enumerate(edited_items):
+        label = str(item.get("label") or "")
+        if label not in baseline_label_set and index < len(baseline_labels):
+            label = baseline_labels[index]
+        if label in used_labels:
+            continue
+        used_labels.add(label)
+        aligned.append(
+            {
+                "label": label,
+                "geometry": safe_geometry(item.get("geometry")),
+                "properties": item.get("properties") or {},
+            }
+        )
+    return aligned
+
+
+def best_recipient_for_lost_piece(
+    piece: Any,
     source_label: str,
-    target_label: str,
-    transfer_geometry: Any,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Move a drawn area from one district into another and return a full proposed plan."""
-    labels = district_label_map(district_gdf)
-    if source_label not in labels or target_label not in labels or source_label == target_label:
-        return [], {"error": "Choose two different valid districts."}
-    if transfer_geometry is None or transfer_geometry.is_empty:
-        return [], {"error": "Draw an area to transfer before estimating the boundary edit."}
+    result_by_label: dict[str, Any],
+    current_by_label: dict[str, Any],
+) -> str | None:
+    """Choose the neighboring district that should receive an uncovered piece."""
+    candidates = []
+    for label, geometry in result_by_label.items():
+        if label == source_label or geometry is None or geometry.is_empty:
+            continue
+        try:
+            current_geometry = current_by_label.get(label)
+            shared_length = piece.boundary.intersection(geometry.boundary).length
+            if current_geometry is not None and not current_geometry.is_empty:
+                shared_length = max(shared_length, piece.boundary.intersection(current_geometry.boundary).length)
+            distance = piece.distance(geometry)
+        except Exception:
+            shared_length = 0.0
+            distance = float("inf")
+        candidates.append((shared_length, -distance, label))
 
-    source_index = labels[source_label]
-    target_index = labels[target_label]
-    source_geometry = safe_geometry(district_gdf.loc[source_index].geometry)
-    target_geometry = safe_geometry(district_gdf.loc[target_index].geometry)
-    transfer_geometry = safe_geometry(transfer_geometry)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda value: (value[0], value[1], natural_sort_key(value[2])))[2]
+
+
+def apply_topology_preserving_edits(
+    current_items: list[dict[str, Any]],
+    baseline_items: list[dict[str, Any]],
+    edited_items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Apply browser-edited boundary changes to the current plan while keeping one clean plan.
+
+    The browser editor moves one polygon at a time. This repair step infers gained and
+    lost area from the edited district and gives/takes that area from neighboring districts.
+    """
+    current_by_label = {item["label"]: safe_geometry(item["geometry"]) for item in current_items}
+    baseline_by_label = {item["label"]: safe_geometry(item["geometry"]) for item in baseline_items}
+    edited_by_label = {item["label"]: safe_geometry(item["geometry"]) for item in edited_items}
 
     try:
-        moved_piece = safe_geometry(source_geometry.intersection(transfer_geometry))
+        current_union = safe_geometry(unary_union([geometry for geometry in current_by_label.values() if geometry is not None]))
     except Exception:
-        return [], {"error": "The drawn transfer area could not be intersected with the source district."}
-    if moved_piece is None or moved_piece.is_empty:
-        return [], {"error": f"The drawn transfer area does not overlap District {source_label}."}
+        current_union = None
 
-    try:
-        new_source = safe_geometry(source_geometry.difference(moved_piece))
-        new_target = safe_geometry(target_geometry.union(moved_piece))
-    except Exception:
-        return [], {"error": "The boundary edit geometry could not be created."}
-    if new_source is None or new_source.is_empty:
-        return [], {"error": f"The edit would remove all of District {source_label}."}
+    result_by_label = dict(current_by_label)
+    changed_labels = []
+    gained_by_label: dict[str, Any] = {}
+    lost_by_label: dict[str, Any] = {}
 
-    items = current_plan_items(district_gdf)
-    for item in items:
-        if item["label"] == source_label:
-            item["geometry"] = new_source
-            item["properties"] = {"source": "edited_source"}
-        elif item["label"] == target_label:
-            item["geometry"] = new_target
-            item["properties"] = {"source": "edited_target"}
+    for label, edited_geometry in edited_by_label.items():
+        baseline_geometry = baseline_by_label.get(label)
+        if label not in current_by_label or baseline_geometry is None or edited_geometry is None:
+            continue
+        if geometry_change_share(baseline_geometry, edited_geometry) < 0.00001:
+            continue
 
-    metrics = proposed_geometry_metrics(moved_piece)
-    metrics.update(
-        {
-            "source_label": source_label,
-            "target_label": target_label,
-            "moved_geometry": moved_piece,
-        }
+        changed_labels.append(label)
+        try:
+            gained = safe_geometry(edited_geometry.difference(baseline_geometry))
+            lost = safe_geometry(baseline_geometry.difference(edited_geometry))
+            if current_union is not None and gained is not None and not gained.is_empty:
+                gained = safe_geometry(gained.intersection(current_union))
+        except Exception:
+            continue
+        gained_by_label[label] = gained
+        lost_by_label[label] = lost
+
+    if not changed_labels:
+        return current_items, []
+
+    for label in changed_labels:
+        updated_geometry = result_by_label[label]
+        lost = lost_by_label.get(label)
+        gained = gained_by_label.get(label)
+        try:
+            if lost is not None and not lost.is_empty:
+                updated_geometry = safe_geometry(updated_geometry.difference(lost))
+            if gained is not None and not gained.is_empty:
+                updated_geometry = safe_geometry(updated_geometry.union(gained))
+        except Exception:
+            continue
+        result_by_label[label] = updated_geometry
+
+    for label, gained in gained_by_label.items():
+        if gained is None or gained.is_empty:
+            continue
+        for other_label, geometry in list(result_by_label.items()):
+            if other_label == label or geometry is None or geometry.is_empty:
+                continue
+            try:
+                if geometry.intersects(gained):
+                    result_by_label[other_label] = safe_geometry(geometry.difference(gained))
+            except Exception:
+                continue
+
+    for source_label, lost in lost_by_label.items():
+        if lost is None or lost.is_empty:
+            continue
+        try:
+            covered = safe_geometry(unary_union([geometry for geometry in result_by_label.values() if geometry is not None]))
+            uncovered = safe_geometry(lost.difference(covered)) if covered is not None else lost
+        except Exception:
+            uncovered = lost
+        for piece in geometry_parts(uncovered):
+            recipient_label = best_recipient_for_lost_piece(piece, source_label, result_by_label, current_by_label)
+            if recipient_label is None:
+                recipient_label = source_label
+            try:
+                result_by_label[recipient_label] = safe_geometry(result_by_label[recipient_label].union(piece))
+            except Exception:
+                continue
+
+    items = []
+    for item in current_items:
+        geometry = result_by_label.get(item["label"])
+        if current_union is not None and geometry is not None and not geometry.is_empty:
+            try:
+                geometry = safe_geometry(geometry.intersection(current_union))
+            except Exception:
+                pass
+        if geometry is None or geometry.is_empty:
+            continue
+        items.append({"label": item["label"], "geometry": geometry, "properties": {"source": "boundary_edit"}})
+    return items, sorted(changed_labels, key=natural_sort_key)
+
+
+def edited_current_plan_items(
+    draw_output: dict[str, Any] | None,
+    session_key: str,
+    current_items: list[dict[str, Any]],
+    baseline_items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read edited current-plan polygons from streamlit-folium and repair them into one plan."""
+    if draw_output and draw_output.get("all_drawings"):
+        st.session_state[session_key] = draw_output["all_drawings"]
+
+    drawings = st.session_state.get(session_key, [])
+    if not drawings:
+        return current_items, []
+
+    edited_items = proposed_geometries_from_geojson({"type": "FeatureCollection", "features": drawings})
+    aligned_items = align_edited_items_to_current_labels(edited_items, baseline_items)
+    if not aligned_items:
+        return current_items, []
+    return apply_topology_preserving_edits(current_items, baseline_items, aligned_items)
+
+
+def create_editable_current_plan_map(
+    district_gdf: gpd.GeoDataFrame,
+    state_name: str,
+    simplify: bool,
+) -> folium.Map:
+    """Build a map where current district polygons are editable instead of manually transferred."""
+    config = STATE_CONFIG[state_name]
+    map_object = folium.Map(
+        location=config["center"],
+        zoom_start=config["zoom"],
+        tiles="cartodbdark_matter",
+        control_scale=True,
     )
-    return items, metrics
+    editable_gdf = current_plan_gdf(district_gdf, simplify)
+    editable_layer = folium.GeoJson(
+        data=geojson_dict(editable_gdf),
+        name="Editable Current Districts",
+        tooltip=folium.GeoJsonTooltip(fields=["proposal_label"], aliases=["District"]),
+        style_function=lambda _: {
+            "fillOpacity": 0.14,
+            "fillColor": "#38bdf8",
+            "color": "#f8fafc",
+            "weight": 1.7,
+            "opacity": 0.95,
+        },
+        highlight_function=lambda _: {"weight": 2.8, "color": "#facc15", "fillOpacity": 0.24},
+    )
+    editable_layer.add_to(map_object)
+    Draw(
+        export=False,
+        feature_group=editable_layer,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": False,
+            "rectangle": False,
+        },
+        edit_options={"edit": True, "remove": False},
+    ).add_to(map_object)
+    folium.LayerControl(collapsed=True).add_to(map_object)
+    return map_object
 
 
-def boundary_edit_preview_items(plan_items: list[dict[str, Any]], labels: list[str]) -> list[dict[str, Any]]:
-    """Return only changed districts for lightweight map preview."""
-    label_set = set(labels)
-    return [item for item in plan_items if item["label"] in label_set]
+def create_proposed_plan_preview_map(
+    district_gdf: gpd.GeoDataFrame,
+    state_name: str,
+    simplify: bool,
+    proposed_items: list[dict[str, Any]],
+) -> folium.Map:
+    """Show a static preview of the repaired proposed plan."""
+    config = STATE_CONFIG[state_name]
+    map_object = folium.Map(
+        location=config["center"],
+        zoom_start=config["zoom"],
+        tiles="cartodbdark_matter",
+        control_scale=True,
+    )
+    current_overlay = prepare_map_gdf(district_gdf, None, simplify, [])
+    if not current_overlay.empty:
+        folium.GeoJson(
+            data=geojson_dict(current_overlay),
+            name="Current District Boundaries",
+            interactive=False,
+            style_function=lambda _: {
+                "fillOpacity": 0.02,
+                "fillColor": "#94a3b8",
+                "color": "#94a3b8",
+                "weight": 1.0,
+                "opacity": 0.65,
+            },
+        ).add_to(map_object)
+    add_proposed_plan_overlay(map_object, proposed_items)
+    folium.LayerControl(collapsed=True).add_to(map_object)
+    return map_object
 
 
 def format_overlap_table(overlaps: pd.DataFrame) -> pd.DataFrame:
@@ -3414,6 +3665,88 @@ def proposed_plan_display_table(estimates: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def plan_topology_diagnostics(
+    district_gdf: gpd.GeoDataFrame,
+    proposed_items: list[dict[str, Any]],
+) -> dict[str, float]:
+    """Measure coverage, gaps, and overlaps for a proposed plan."""
+    if district_gdf is None or district_gdf.empty or not proposed_items:
+        return {}
+    try:
+        current_projected = projected_area_gdf(district_gdf[["geometry"]].copy())
+        proposed_gdf = gpd.GeoDataFrame(
+            {"geometry": [safe_geometry(item["geometry"]) for item in proposed_items]},
+            crs=4326,
+        )
+        proposed_projected = projected_area_gdf(proposed_gdf)
+        current_union = safe_geometry(unary_union(current_projected.geometry))
+        proposed_geometries = [
+            safe_geometry(geometry)
+            for geometry in proposed_projected.geometry
+            if geometry is not None and not geometry.is_empty
+        ]
+        proposed_union = safe_geometry(unary_union(proposed_geometries))
+    except Exception:
+        return {}
+
+    if current_union is None or current_union.is_empty or proposed_union is None or proposed_union.is_empty:
+        return {}
+
+    current_area = float(current_union.area)
+    if current_area <= 0:
+        return {}
+
+    try:
+        gap_area = float(current_union.difference(proposed_union).area)
+        outside_area = float(proposed_union.difference(current_union).area)
+    except Exception:
+        gap_area = np.nan
+        outside_area = np.nan
+
+    overlap_area = 0.0
+    assigned_geometry = None
+    for geometry in proposed_geometries:
+        try:
+            if assigned_geometry is not None:
+                overlap_area += float(geometry.intersection(assigned_geometry).area)
+                assigned_geometry = safe_geometry(assigned_geometry.union(geometry))
+            else:
+                assigned_geometry = geometry
+        except Exception:
+            continue
+
+    return {
+        "coverage_share": max(0.0, min(1.0, 1.0 - (gap_area / current_area))) if pd.notna(gap_area) else np.nan,
+        "gap_share": gap_area / current_area if pd.notna(gap_area) else np.nan,
+        "overlap_share": overlap_area / current_area if pd.notna(overlap_area) else np.nan,
+        "outside_share": outside_area / current_area if pd.notna(outside_area) else np.nan,
+    }
+
+
+def display_plan_topology_status(district_gdf: gpd.GeoDataFrame, proposed_items: list[dict[str, Any]]) -> None:
+    """Show whether a proposed plan covers the current district layer cleanly."""
+    diagnostics = plan_topology_diagnostics(district_gdf, proposed_items)
+    if not diagnostics:
+        return
+
+    topology_columns = st.columns(4)
+    topology_columns[0].metric("Plan Coverage", format_percent(diagnostics.get("coverage_share")))
+    topology_columns[1].metric("Internal Gaps", format_percent(diagnostics.get("gap_share")))
+    topology_columns[2].metric("Internal Overlap", format_percent(diagnostics.get("overlap_share")))
+    topology_columns[3].metric("Outside Current Map", format_percent(diagnostics.get("outside_share")))
+
+    gap_share = safe_numeric(pd.Series([diagnostics.get("gap_share")])).iloc[0]
+    overlap_share = safe_numeric(pd.Series([diagnostics.get("overlap_share")])).iloc[0]
+    outside_share = safe_numeric(pd.Series([diagnostics.get("outside_share")])).iloc[0]
+    if max(gap_share, overlap_share, outside_share) <= 0.001:
+        st.success("Topology check: the proposed plan has no meaningful gaps or overlaps against the current district map.")
+    else:
+        st.warning(
+            "Topology check: this plan has visible gaps, overlaps, or area outside the current map. "
+            "Treat the outcome numbers as exploratory."
+        )
+
+
 def display_proposed_plan_mode(
     district_gdf: gpd.GeoDataFrame,
     state_name: str,
@@ -3430,66 +3763,54 @@ def display_proposed_plan_mode(
 
     plan_mode = st.radio(
         "Proposed plan method",
-        ["Boundary edit from current plan", "Draw or upload custom plan"],
+        ["Edit current boundaries", "Draw or upload custom plan"],
         horizontal=True,
         key=f"{state_name}_proposed_plan_method",
     )
 
     proposed_items: list[dict[str, Any]] = []
-    preview_items: list[dict[str, Any]] = []
-    moved_metrics: dict[str, Any] = {}
 
-    if plan_mode == "Boundary edit from current plan":
-        labels = list(district_label_map(district_gdf).keys())
-        source_col, target_col = st.columns(2)
-        with source_col:
-            source_label = st.selectbox(
-                "Move area from district",
-                labels,
-                key=f"{state_name}_boundary_source_district",
-            )
-        target_options = [label for label in labels if label != source_label]
-        with target_col:
-            target_label = st.selectbox(
-                "Move area into district",
-                target_options,
-                key=f"{state_name}_boundary_target_district",
-            )
+    if plan_mode == "Edit current boundaries":
+        edit_session_key = f"{state_name}_editable_current_plan_features"
+        current_items = current_plan_items(district_gdf, simplify=False)
+        baseline_items = current_plan_items(district_gdf, simplify=simplify)
 
-        boundary_session_key = f"{state_name}_boundary_transfer_feature"
-        if st.button("Clear boundary edit", key=f"{state_name}_clear_boundary_edit"):
-            st.session_state.pop(boundary_session_key, None)
+        if st.button("Reset boundary edits", key=f"{state_name}_reset_editable_boundaries"):
+            st.session_state.pop(edit_session_key, None)
 
-        draw_map = create_hypothetical_draw_map(district_gdf, state_name, simplify)
+        st.caption(
+            "Use the map edit tool, drag district boundary vertices, then save the edit in the map toolbar. "
+            "The app repairs the changed area into neighboring districts and updates the plan summary below."
+        )
+        edit_map = create_editable_current_plan_map(district_gdf, state_name, simplify)
         draw_output = st_folium(
-            draw_map,
+            edit_map,
             height=560,
             use_container_width=True,
             returned_objects=["last_active_drawing", "all_drawings"],
-            key=f"{state_name}_boundary_edit_draw_map",
+            key=f"{state_name}_editable_current_plan_map",
         )
-        transfer_geometry = latest_drawn_geometry(draw_output, boundary_session_key)
-        proposed_items, moved_metrics = boundary_adjusted_plan_items(
-            district_gdf,
-            source_label,
-            target_label,
-            transfer_geometry,
+        proposed_items, changed_labels = edited_current_plan_items(
+            draw_output,
+            edit_session_key,
+            current_items,
+            baseline_items,
         )
-        if moved_metrics.get("error"):
-            st.info(moved_metrics["error"])
-            return
-        preview_items = boundary_edit_preview_items(proposed_items, [source_label, target_label])
-        st.caption(
-            f"Moved area estimate: {format_square_miles(moved_metrics.get('district_area_sq_mi'))} "
-            f"from District {source_label} into District {target_label}."
-        )
-        preview_map = create_proposed_plan_map(district_gdf, state_name, simplify, preview_items)
+        if changed_labels:
+            label_text = ", ".join(changed_labels[:12])
+            if len(changed_labels) > 12:
+                label_text += f", +{len(changed_labels) - 12} more"
+            st.caption(f"Edited district boundary detected for: {label_text}.")
+        else:
+            st.info("Current boundaries are loaded as the baseline. After you drag and save an edit, this becomes the proposed plan.")
+
+        preview_map = create_proposed_plan_preview_map(district_gdf, state_name, simplify, proposed_items)
         st_folium(
             preview_map,
             height=420,
             use_container_width=True,
             returned_objects=[],
-            key=f"{state_name}_boundary_preview_map",
+            key=f"{state_name}_editable_plan_preview_map",
         )
     else:
         upload_key = f"{state_name}_proposed_plan_geojson_upload"
@@ -3534,6 +3855,7 @@ def display_proposed_plan_mode(
 
     summary_tab, district_tab = st.tabs(["Plan Outcome Summary", "Proposed Districts"])
     with summary_tab:
+        display_plan_topology_status(district_gdf, proposed_items)
         st.dataframe(
             proposed_plan_summary_table(district_gdf, estimates),
             hide_index=True,
