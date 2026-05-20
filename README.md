@@ -64,6 +64,10 @@ Congressional district view also includes a hypothetical district tool. Draw a p
 
 Congressional district view includes redistricting metrics for compactness, district area, district perimeter, majority-minority CVAP status, and competitiveness. Compactness uses the Polsby-Popper score, where higher values are more compact. Competitive districts are those with a two-party winner margin of 10 percentage points or less.
 
+## CA vs LA Comparison
+
+Congressional district view includes a comparison section that loads the compact California and Louisiana district files side by side. The comparison has tabs for statewide summaries, district leaders, and a combined district table covering vote share, turnout, CVAP, compactness, area, and vote totals.
+
 ## Deploy
 
 This repo is ready for Streamlit Community Cloud:

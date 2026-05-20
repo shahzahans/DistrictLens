@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 compactness-contrast"
+APP_VERSION = "2026-05-20 state-comparison"
 
 STATE_CONFIG = {
     "California": {
@@ -3085,6 +3085,189 @@ def display_redistricting_metrics(gdf: gpd.GeoDataFrame) -> None:
         st.dataframe(table, hide_index=True, use_container_width=True, height=table_height)
 
 
+@st.cache_data(show_spinner=False)
+def load_comparison_districts(app_version: str = APP_VERSION) -> tuple[dict[str, gpd.GeoDataFrame], list[str]]:
+    """Load compact district files for the CA vs LA comparison panel."""
+    del app_version
+    comparison_data: dict[str, gpd.GeoDataFrame] = {}
+    messages: list[str] = []
+
+    for state_name in STATE_CONFIG:
+        path = deploy_district_path(state_name)
+        if not path.exists():
+            messages.append(f"{state_name}: comparison file was not found at {path.name}.")
+            continue
+        try:
+            gdf = gpd.read_file(path, engine="pyogrio")
+            gdf = ensure_wgs84(gdf, f"{state_name} comparison districts", messages)
+            gdf = add_redistricting_metrics(gdf)
+        except Exception as exc:
+            messages.append(f"{state_name}: comparison data could not be loaded: {exc}")
+            continue
+        comparison_data[state_name] = gdf
+
+    return comparison_data, messages
+
+
+def comparison_state_summary_rows(comparison_data: dict[str, gpd.GeoDataFrame]) -> pd.DataFrame:
+    """Create one formatted summary row per state."""
+    rows = []
+    for state_name, gdf in comparison_data.items():
+        summary = summarize_metrics(gdf)
+        winner_margin = safe_numeric(gdf.get("winner_margin", pd.Series(dtype="float64")))
+        minority_cvap = safe_numeric(gdf.get("minority_cvap_pct", pd.Series(dtype="float64")))
+        compactness = safe_numeric(gdf.get("compactness_polsby_popper", pd.Series(dtype="float64")))
+        young_turnout = safe_numeric(gdf.get("young_voter_turnout", pd.Series(dtype="float64")))
+        rows.append(
+            {
+                "State": state_name,
+                "Districts": format_number(summary.get("rows")),
+                "Statewide D share": format_percent(summary.get("statewide_democratic_share")),
+                "Statewide R share": format_percent(summary.get("statewide_republican_share")),
+                "Average turnout": format_percent(summary.get("average_turnout_rate")),
+                "Average young turnout": format_percent(young_turnout.mean()),
+                "Average minority CVAP": format_percent(minority_cvap.mean()),
+                "Majority-minority districts": format_number((minority_cvap >= 0.50).sum()),
+                "Competitive districts": format_number((winner_margin <= 0.10).sum()),
+                "Average compactness": format_decimal_score(compactness.mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def comparison_district_frame(comparison_data: dict[str, gpd.GeoDataFrame]) -> pd.DataFrame:
+    """Create a combined district table with raw numeric columns for comparison."""
+    rows = []
+    for state_name, gdf in comparison_data.items():
+        id_column = district_id_column(gdf)
+        for index, row in gdf.drop(columns="geometry", errors="ignore").iterrows():
+            district_value = row[id_column] if id_column in row.index else index
+            dem_share = safe_numeric(pd.Series([row.get("dem_share")])).iloc[0]
+            rep_share = safe_numeric(pd.Series([row.get("rep_share")])).iloc[0]
+            if pd.isna(dem_share) or pd.isna(rep_share):
+                vote_winner = "Not available"
+            else:
+                vote_winner = "Democratic" if dem_share >= rep_share else "Republican"
+            rows.append(
+                {
+                    "State": state_name,
+                    "District": format_district_label(district_value),
+                    "Competitiveness": row.get("competitiveness_label", "Not available"),
+                    "Vote winner": vote_winner,
+                    "Winner margin": safe_numeric(pd.Series([row.get("winner_margin")])).iloc[0],
+                    "Democratic share": dem_share,
+                    "Overall turnout": safe_numeric(pd.Series([row.get("turnout_rate")])).iloc[0],
+                    "Young turnout": safe_numeric(pd.Series([row.get("young_voter_turnout")])).iloc[0],
+                    "Minority CVAP": safe_numeric(pd.Series([row.get("minority_cvap_pct")])).iloc[0],
+                    "Black CVAP": safe_numeric(pd.Series([row.get("black_cvap_pct")])).iloc[0],
+                    "Latino CVAP": safe_numeric(pd.Series([row.get("latino_cvap_pct")])).iloc[0],
+                    "Compactness": safe_numeric(pd.Series([row.get("compactness_polsby_popper")])).iloc[0],
+                    "Area": safe_numeric(pd.Series([row.get("district_area_sq_mi")])).iloc[0],
+                    "D + R votes": safe_numeric(pd.Series([row.get("total_dr_votes")])).iloc[0],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def comparison_display_table(frame: pd.DataFrame) -> pd.DataFrame:
+    """Format the combined comparison table for Streamlit display."""
+    if frame.empty:
+        return pd.DataFrame()
+    table = frame.copy()
+    table = table.sort_values(
+        ["State", "District"],
+        ascending=[True, True],
+        key=lambda series: series.map(natural_sort_key) if series.name == "District" else series,
+    )
+    return pd.DataFrame(
+        {
+            "State": table["State"],
+            "District": table["District"],
+            "Vote winner": table["Vote winner"],
+            "Competitiveness": table["Competitiveness"],
+            "Winner margin": table["Winner margin"].map(format_percent),
+            "D share": table["Democratic share"].map(format_percent),
+            "Turnout": table["Overall turnout"].map(format_percent),
+            "Young turnout": table["Young turnout"].map(format_percent),
+            "Minority CVAP": table["Minority CVAP"].map(format_percent),
+            "Black CVAP": table["Black CVAP"].map(format_percent),
+            "Latino CVAP": table["Latino CVAP"].map(format_percent),
+            "Compactness": table["Compactness"].map(format_decimal_score),
+            "Area": table["Area"].map(format_square_miles),
+            "D + R votes": table["D + R votes"].map(format_number),
+        }
+    )
+
+
+def comparison_leader_cell(frame: pd.DataFrame, state_name: str, column: str, largest: bool, formatter: Any) -> str:
+    """Return one formatted state leader cell."""
+    state_frame = frame[frame["State"] == state_name].copy()
+    values = safe_numeric(state_frame[column])
+    state_frame = state_frame[values.notna()].copy()
+    if state_frame.empty:
+        return "Not available"
+    values = safe_numeric(state_frame[column])
+    leader_index = values.idxmax() if largest else values.idxmin()
+    leader = state_frame.loc[leader_index]
+    return f"District {leader['District']} ({formatter(leader[column])})"
+
+
+def comparison_leaders_table(frame: pd.DataFrame) -> pd.DataFrame:
+    """Create a side-by-side table of state leaders."""
+    if frame.empty:
+        return pd.DataFrame()
+
+    leader_specs = [
+        ("Most competitive", "Winner margin", False, format_percent),
+        ("Highest minority CVAP", "Minority CVAP", True, format_percent),
+        ("Highest Black CVAP", "Black CVAP", True, format_percent),
+        ("Highest Latino CVAP", "Latino CVAP", True, format_percent),
+        ("Highest overall turnout", "Overall turnout", True, format_percent),
+        ("Highest young turnout", "Young turnout", True, format_percent),
+        ("Most compact", "Compactness", True, format_decimal_score),
+        ("Largest district", "Area", True, format_square_miles),
+        ("Most D + R votes", "D + R votes", True, format_number),
+    ]
+    rows = []
+    for label, column, largest, formatter in leader_specs:
+        row = {"Category": label}
+        for state_name in comparison_state_order(frame):
+            row[state_name] = comparison_leader_cell(frame, state_name, column, largest, formatter)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def comparison_state_order(frame: pd.DataFrame) -> list[str]:
+    """Preserve configured state order for comparison display."""
+    present_states = set(frame.get("State", pd.Series(dtype="object")).dropna())
+    return [state_name for state_name in STATE_CONFIG if state_name in present_states]
+
+
+def display_state_comparison() -> None:
+    """Show side-by-side California and Louisiana comparison tabs."""
+    st.subheader("CA vs LA Comparison")
+    comparison_data, messages = load_comparison_districts(APP_VERSION)
+    for message in messages:
+        st.warning(message)
+    if len(comparison_data) < 2:
+        st.info("Comparison needs both compact district files.")
+        return
+
+    summary_table = comparison_state_summary_rows(comparison_data)
+    district_frame = comparison_district_frame(comparison_data)
+    leaders_table = comparison_leaders_table(district_frame)
+
+    summary_tab, leaders_tab, districts_tab = st.tabs(["State Summary", "District Leaders", "All Districts"])
+    with summary_tab:
+        st.dataframe(summary_table, hide_index=True, use_container_width=True)
+    with leaders_tab:
+        st.dataframe(leaders_table, hide_index=True, use_container_width=True)
+    with districts_tab:
+        display_table = comparison_display_table(district_frame)
+        table_height = min(560, 38 * (len(display_table) + 1))
+        st.dataframe(display_table, hide_index=True, use_container_width=True, height=table_height)
+
+
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
     """Draw the requested top-10 bar charts."""
     detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
@@ -3336,6 +3519,7 @@ def main() -> None:
     if geography == "Congressional Districts":
         display_district_scorecard(active_gdf, state_name)
         display_redistricting_metrics(active_gdf)
+        display_state_comparison()
         display_hypothetical_district_tool(active_gdf, state_name, simplify)
 
     st.subheader("Charts")
