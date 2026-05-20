@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 editable-boundary-polygons"
+APP_VERSION = "2026-05-20 automatic-boundary-adjustment"
 
 STATE_CONFIG = {
     "California": {
@@ -3336,6 +3336,136 @@ def apply_topology_preserving_edits(
     return items, sorted(changed_labels, key=natural_sort_key)
 
 
+def boundary_adjustment_overlaps(
+    district_gdf: gpd.GeoDataFrame,
+    adjustment_geometry: Any,
+) -> list[dict[str, Any]]:
+    """Rank current districts by how much they overlap a drawn boundary-adjustment area."""
+    if adjustment_geometry is None or adjustment_geometry.is_empty:
+        return []
+
+    try:
+        district_equal_area = projected_area_gdf(district_gdf)
+        adjustment_equal_area = projected_area_gdf(
+            gpd.GeoDataFrame({"geometry": [safe_geometry(adjustment_geometry)]}, crs=4326)
+        ).geometry.iloc[0]
+    except Exception:
+        return []
+
+    rows = []
+    labels = district_label_map(district_gdf)
+    for label, index in labels.items():
+        geometry = district_equal_area.loc[index].geometry
+        if geometry is None or geometry.is_empty or not geometry.intersects(adjustment_equal_area):
+            continue
+        try:
+            overlap_area = float(geometry.intersection(adjustment_equal_area).area)
+        except Exception:
+            continue
+        if overlap_area <= 0:
+            continue
+        rows.append({"label": label, "index": index, "overlap_area": overlap_area})
+    return sorted(rows, key=lambda row: row["overlap_area"], reverse=True)
+
+
+def nearest_neighbor_label(
+    source_label: str,
+    source_piece: Any,
+    district_gdf: gpd.GeoDataFrame,
+) -> str | None:
+    """Find the adjacent district most likely to receive a drawn boundary-adjustment piece."""
+    labels = district_label_map(district_gdf)
+    if source_label not in labels:
+        return None
+
+    candidates = []
+    for label, index in labels.items():
+        if label == source_label:
+            continue
+        geometry = safe_geometry(district_gdf.loc[index].geometry)
+        if geometry is None or geometry.is_empty:
+            continue
+        try:
+            shared_length = float(source_piece.boundary.intersection(geometry.boundary).length)
+            distance = float(source_piece.distance(geometry))
+        except Exception:
+            shared_length = 0.0
+            distance = float("inf")
+        candidates.append((shared_length, -distance, label))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda value: (value[0], value[1], natural_sort_key(value[2])))[2]
+
+
+def plan_items_for_labels(plan_items: list[dict[str, Any]], labels: list[str]) -> list[dict[str, Any]]:
+    """Return selected proposed-plan items for a focused preview map."""
+    label_set = set(labels)
+    return [item for item in plan_items if item["label"] in label_set]
+
+
+def auto_boundary_adjusted_plan_items(
+    district_gdf: gpd.GeoDataFrame,
+    adjustment_geometry: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Move a drawn boundary-adjustment area into the most likely neighboring district."""
+    if adjustment_geometry is None or adjustment_geometry.is_empty:
+        return [], {"error": "Draw a small area along a district boundary to adjust the plan."}
+
+    overlaps = boundary_adjustment_overlaps(district_gdf, adjustment_geometry)
+    if not overlaps:
+        return [], {"error": "The drawn adjustment area does not overlap the current district layer."}
+
+    labels = district_label_map(district_gdf)
+    source_label = overlaps[0]["label"]
+    source_index = labels[source_label]
+    source_geometry = safe_geometry(district_gdf.loc[source_index].geometry)
+    adjustment_geometry = safe_geometry(adjustment_geometry)
+
+    try:
+        moved_piece = safe_geometry(source_geometry.intersection(adjustment_geometry))
+    except Exception:
+        return [], {"error": "The drawn adjustment area could not be intersected with the source district."}
+    if moved_piece is None or moved_piece.is_empty:
+        return [], {"error": f"The drawn adjustment area does not overlap District {source_label}."}
+
+    if len(overlaps) >= 2:
+        target_label = overlaps[1]["label"]
+    else:
+        target_label = nearest_neighbor_label(source_label, moved_piece, district_gdf)
+    if not target_label or target_label not in labels or target_label == source_label:
+        return [], {"error": "The app could not detect a neighboring district to receive the adjusted area."}
+
+    target_index = labels[target_label]
+    target_geometry = safe_geometry(district_gdf.loc[target_index].geometry)
+    try:
+        new_source = safe_geometry(source_geometry.difference(moved_piece))
+        new_target = safe_geometry(target_geometry.union(moved_piece))
+    except Exception:
+        return [], {"error": "The boundary adjustment geometry could not be created."}
+    if new_source is None or new_source.is_empty:
+        return [], {"error": f"The adjustment would remove all of District {source_label}."}
+
+    items = current_plan_items(district_gdf)
+    for item in items:
+        if item["label"] == source_label:
+            item["geometry"] = new_source
+            item["properties"] = {"source": "auto_adjusted_source"}
+        elif item["label"] == target_label:
+            item["geometry"] = new_target
+            item["properties"] = {"source": "auto_adjusted_target"}
+
+    metrics = proposed_geometry_metrics(moved_piece)
+    metrics.update(
+        {
+            "source_label": source_label,
+            "target_label": target_label,
+            "overlap_count": len(overlaps),
+            "moved_geometry": moved_piece,
+        }
+    )
+    return items, metrics
+
+
 def edited_current_plan_items(
     draw_output: dict[str, Any] | None,
     session_key: str,
@@ -3812,14 +3942,54 @@ def display_proposed_plan_mode(
 
     plan_mode = st.radio(
         "Proposed plan method",
-        ["Edit current boundaries", "Draw or upload custom plan"],
+        ["Draw boundary adjustment", "Edit current boundaries", "Draw or upload custom plan"],
         horizontal=True,
         key=f"{state_name}_proposed_plan_method",
     )
 
     proposed_items: list[dict[str, Any]] = []
 
-    if plan_mode == "Edit current boundaries":
+    if plan_mode == "Draw boundary adjustment":
+        adjustment_session_key = f"{state_name}_auto_boundary_adjustment_feature"
+        if st.button("Clear boundary adjustment", key=f"{state_name}_clear_auto_boundary_adjustment"):
+            st.session_state.pop(adjustment_session_key, None)
+
+        st.caption(
+            "Draw a small polygon over the area you want to move across a boundary. "
+            "Draw it mostly inside the district you want to shrink and across or near the neighbor you want to grow. "
+            "The app detects the district with the most overlap as the district losing area and the next neighbor as the district gaining area."
+        )
+        adjustment_map = create_hypothetical_draw_map(district_gdf, state_name, simplify)
+        draw_output = st_folium(
+            adjustment_map,
+            height=560,
+            use_container_width=True,
+            returned_objects=["last_active_drawing", "all_drawings"],
+            key=f"{state_name}_auto_boundary_adjustment_map",
+        )
+        adjustment_geometry = latest_drawn_geometry(draw_output, adjustment_session_key)
+        proposed_items, adjustment_metrics = auto_boundary_adjusted_plan_items(district_gdf, adjustment_geometry)
+        if adjustment_metrics.get("error"):
+            st.info(adjustment_metrics["error"])
+            return
+
+        source_label = adjustment_metrics.get("source_label")
+        target_label = adjustment_metrics.get("target_label")
+        st.caption(
+            f"Auto-detected adjustment: District {source_label} loses about "
+            f"{format_square_miles(adjustment_metrics.get('district_area_sq_mi'))}; "
+            f"District {target_label} gains that area."
+        )
+        preview_items = plan_items_for_labels(proposed_items, [source_label, target_label])
+        preview_map = create_proposed_plan_preview_map(district_gdf, state_name, simplify, preview_items)
+        st_folium(
+            preview_map,
+            height=420,
+            use_container_width=True,
+            returned_objects=[],
+            key=f"{state_name}_auto_boundary_adjustment_preview_map",
+        )
+    elif plan_mode == "Edit current boundaries":
         edit_session_key = f"{state_name}_editable_current_plan_features"
         current_items = current_plan_items(district_gdf, simplify=False)
         baseline_part_items = current_plan_part_items(district_gdf, simplify=simplify)
