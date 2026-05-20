@@ -52,6 +52,10 @@ streamlit run app.py
 
 The dashboard opens in your browser. Use the sidebar to choose a state, geography, map layer, district overlay, city markers, and simplified geometry.
 
+## District Scorecard
+
+Congressional district view includes a district scorecard for California and Louisiana. Select a district to see the vote winner, D/R margin, competitive rank, minority CVAP share, and young turnout. The ranking table can sort districts by competitiveness, minority CVAP share, young turnout, overall turnout, Democratic margin, Republican margin, winner margin, or D + R votes.
+
 ## Deploy
 
 This repo is ready for Streamlit Community Cloud:

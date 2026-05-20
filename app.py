@@ -32,7 +32,7 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
-APP_VERSION = "2026-05-06 california-party-vote-shading"
+APP_VERSION = "2026-05-20 district-scorecard"
 
 STATE_CONFIG = {
     "California": {
@@ -296,6 +296,41 @@ def format_percent(value: Any) -> str:
     if number > 1.5:
         number = number / 100
     return f"{number:.1%}"
+
+
+def format_percentage_points(value: Any) -> str:
+    number = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number * 100:.1f} pp"
+
+
+def format_rank(value: Any, total: int) -> str:
+    number = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"#{int(number)} of {total}"
+
+
+def format_competitiveness_score(value: Any) -> str:
+    number = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(number):
+        return "Not available"
+    return f"{number:.0f}/100"
+
+
+def format_district_label(value: Any) -> str:
+    if pd.isna(value):
+        return "Not available"
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        return str(int(float(text)))
+    return text
+
+
+def natural_sort_key(value: Any) -> tuple[Any, ...]:
+    parts = re.split(r"(\d+)", str(value))
+    return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
 
 
 # ---------------------------------------------------------------------------
@@ -2300,6 +2335,192 @@ def display_summary_metrics(gdf: gpd.GeoDataFrame) -> None:
     columns[4].metric("Average Turnout Rate", format_percent(summary.get("average_turnout_rate")))
 
 
+def district_id_column(gdf: gpd.GeoDataFrame) -> str | None:
+    """Find the best district identifier for scorecard display."""
+    detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
+    district_col = detected.get("district_id")
+    return district_col if district_col in gdf.columns else None
+
+
+def build_district_scorecard(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Create district-level profile, ranking, and label fields."""
+    attrs = gdf.drop(columns="geometry", errors="ignore").copy()
+    if attrs.empty:
+        return pd.DataFrame()
+
+    id_column = district_id_column(gdf)
+    district_values = attrs[id_column] if id_column in attrs.columns else pd.Series(attrs.index, index=attrs.index)
+
+    scorecard = pd.DataFrame(index=attrs.index)
+    scorecard["district"] = district_values.map(format_district_label)
+
+    numeric_columns = [
+        "dem_votes",
+        "rep_votes",
+        "total_dr_votes",
+        "dem_share",
+        "rep_share",
+        "turnout_rate",
+        "minority_cvap_pct",
+        "young_voter_turnout",
+    ]
+    for column in numeric_columns:
+        if column in attrs.columns:
+            scorecard[column] = safe_numeric(attrs[column])
+        else:
+            scorecard[column] = np.nan
+
+    dem_share = scorecard["dem_share"]
+    rep_share = scorecard["rep_share"]
+    valid_vote_share = dem_share.notna() & rep_share.notna()
+    scorecard["winner"] = "Not available"
+    scorecard.loc[valid_vote_share & (dem_share >= rep_share), "winner"] = "Democratic"
+    scorecard.loc[valid_vote_share & (rep_share > dem_share), "winner"] = "Republican"
+    scorecard["vote_margin"] = (dem_share - rep_share).abs()
+    scorecard["democratic_margin"] = dem_share - rep_share
+    scorecard["republican_margin"] = rep_share - dem_share
+    scorecard["competitiveness_score"] = ((1 - scorecard["vote_margin"]).clip(0, 1) * 100).round(1)
+
+    total_districts = len(scorecard)
+    scorecard["competitiveness_rank"] = scorecard["vote_margin"].rank(method="min", ascending=True)
+    scorecard["minority_cvap_rank"] = scorecard["minority_cvap_pct"].rank(method="min", ascending=False)
+    scorecard["young_turnout_rank"] = scorecard["young_voter_turnout"].rank(method="min", ascending=False)
+    scorecard["turnout_rank"] = scorecard["turnout_rate"].rank(method="min", ascending=False)
+    scorecard["winner_margin_rank"] = scorecard["vote_margin"].rank(method="min", ascending=False)
+    scorecard["total_districts"] = total_districts
+    return scorecard
+
+
+def competitiveness_label(value: Any) -> str:
+    margin = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(margin):
+        return "Competitiveness unknown"
+    if margin <= 0.05:
+        return "Toss-up district"
+    if margin <= 0.10:
+        return "Competitive district"
+    if margin <= 0.20:
+        return "Leaning district"
+    return "Safe district"
+
+
+def format_party_margin(row: pd.Series) -> str:
+    dem_margin = safe_numeric(pd.Series([row.get("democratic_margin")])).iloc[0]
+    if pd.isna(dem_margin):
+        return "Not available"
+    party = "D" if dem_margin >= 0 else "R"
+    return f"{party} +{abs(dem_margin) * 100:.1f} pp"
+
+
+def district_scorecard_tags(row: pd.Series, scorecard: pd.DataFrame) -> list[str]:
+    """Create short qualitative labels for the selected district."""
+    tags = [competitiveness_label(row.get("vote_margin"))]
+
+    minority_cvap = safe_numeric(pd.Series([row.get("minority_cvap_pct")])).iloc[0]
+    if pd.notna(minority_cvap):
+        if minority_cvap >= 0.50:
+            tags.append("Majority-minority CVAP")
+        elif minority_cvap >= 0.40:
+            tags.append("Near majority-minority CVAP")
+
+    turnout = safe_numeric(pd.Series([row.get("turnout_rate")])).iloc[0]
+    turnout_median = safe_numeric(scorecard.get("turnout_rate", pd.Series(dtype="float64"))).median()
+    if pd.notna(turnout) and pd.notna(turnout_median):
+        if turnout >= turnout_median + 0.05:
+            tags.append("High overall turnout")
+        elif turnout <= turnout_median - 0.05:
+            tags.append("Low overall turnout")
+
+    young_turnout = safe_numeric(pd.Series([row.get("young_voter_turnout")])).iloc[0]
+    young_median = safe_numeric(scorecard.get("young_voter_turnout", pd.Series(dtype="float64"))).median()
+    if pd.notna(young_turnout) and pd.notna(young_median):
+        if young_turnout >= young_median + 0.05:
+            tags.append("High young turnout")
+        elif young_turnout <= young_median - 0.05:
+            tags.append("Low young turnout")
+
+    return tags
+
+
+def district_ranking_display(scorecard: pd.DataFrame, sort_column: str, ascending: bool) -> pd.DataFrame:
+    """Return a formatted ranking table for Streamlit display."""
+    ranked = scorecard.copy()
+    ranked["_rank_value"] = safe_numeric(ranked[sort_column])
+    ranked = ranked[ranked["_rank_value"].notna()].sort_values(
+        ["_rank_value", "district"],
+        ascending=[ascending, True],
+        key=lambda series: series.map(natural_sort_key) if series.name == "district" else series,
+    )
+    ranked = ranked.reset_index(drop=True)
+    ranked["Rank"] = np.arange(1, len(ranked) + 1)
+
+    return pd.DataFrame(
+        {
+            "Rank": ranked["Rank"],
+            "District": ranked["district"],
+            "Winner": ranked["winner"],
+            "D/R margin": ranked.apply(format_party_margin, axis=1),
+            "Competitiveness": ranked["competitiveness_score"].map(format_competitiveness_score),
+            "Minority CVAP": ranked["minority_cvap_pct"].map(format_percent),
+            "Overall turnout": ranked["turnout_rate"].map(format_percent),
+            "Young turnout": ranked["young_voter_turnout"].map(format_percent),
+            "D + R votes": ranked["total_dr_votes"].map(format_number),
+        }
+    )
+
+
+def display_district_scorecard(gdf: gpd.GeoDataFrame, state_name: str) -> None:
+    """Display a district selector, profile metrics, and ranking model."""
+    scorecard = build_district_scorecard(gdf)
+    if scorecard.empty:
+        st.info("District scorecard could not be created for this data.")
+        return
+
+    st.subheader("District Scorecard")
+    district_options = sorted(scorecard["district"].dropna().unique(), key=natural_sort_key)
+    selected_district = st.selectbox(
+        "Select district",
+        district_options,
+        key=f"{state_name}_district_scorecard_select",
+    )
+    selected_row = scorecard.loc[scorecard["district"] == selected_district].iloc[0]
+
+    profile_columns = st.columns(5)
+    profile_columns[0].metric("Vote Winner", selected_row.get("winner", "Not available"))
+    profile_columns[1].metric("D/R Margin", format_party_margin(selected_row))
+    profile_columns[2].metric(
+        "Competitive Rank",
+        format_rank(selected_row.get("competitiveness_rank"), len(scorecard)),
+    )
+    profile_columns[3].metric("Minority CVAP", format_percent(selected_row.get("minority_cvap_pct")))
+    profile_columns[4].metric("Young Turnout", format_percent(selected_row.get("young_voter_turnout")))
+
+    st.caption("Scorecard tags: " + " | ".join(district_scorecard_tags(selected_row, scorecard)))
+
+    rank_options = {
+        "Competitiveness": ("vote_margin", True),
+        "Minority CVAP share": ("minority_cvap_pct", False),
+        "Young turnout": ("young_voter_turnout", False),
+        "Overall turnout": ("turnout_rate", False),
+        "Democratic margin": ("democratic_margin", False),
+        "Republican margin": ("republican_margin", False),
+        "Winner margin": ("vote_margin", False),
+        "D + R votes": ("total_dr_votes", False),
+    }
+    ranking_choice = st.selectbox(
+        "Rank districts by",
+        list(rank_options.keys()),
+        key=f"{state_name}_district_rank_dimension",
+    )
+    sort_column, ascending = rank_options[ranking_choice]
+    ranking_table = district_ranking_display(scorecard, sort_column, ascending)
+    if ranking_table.empty:
+        st.info(f"{ranking_choice} could not be ranked because the needed data is unavailable.")
+    else:
+        table_height = min(560, 38 * (len(ranking_table) + 1))
+        st.dataframe(ranking_table, hide_index=True, use_container_width=True, height=table_height)
+
+
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
     """Draw the requested top-10 bar charts."""
     detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
@@ -2534,6 +2755,9 @@ def main() -> None:
 
     st.subheader("Summary Metrics")
     display_summary_metrics(active_gdf)
+
+    if geography == "Congressional Districts":
+        display_district_scorecard(active_gdf, state_name)
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
