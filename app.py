@@ -36,7 +36,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 editable-boundary-plan"
+APP_VERSION = "2026-05-20 editable-boundary-polygons"
 
 STATE_CONFIG = {
     "California": {
@@ -3082,16 +3082,23 @@ def current_plan_gdf(gdf: gpd.GeoDataFrame, simplify: bool = False) -> gpd.GeoDa
     return prepare_map_gdf(plan_gdf, None, simplify, ["proposal_label"])
 
 
-def current_plan_items(gdf: gpd.GeoDataFrame, simplify: bool = False) -> list[dict[str, Any]]:
-    """Convert current district geometries into proposed-plan item objects."""
+def current_plan_part_items(gdf: gpd.GeoDataFrame, simplify: bool = False) -> list[dict[str, Any]]:
+    """Convert current district geometries into single polygon parts for Leaflet editing."""
     plan_gdf = current_plan_gdf(gdf, simplify)
     items = []
     for _, row in plan_gdf.iterrows():
-        geometry = row.geometry
-        if geometry is None or geometry.is_empty:
-            continue
         label = format_district_label(row.get("proposal_label", len(items) + 1))
-        items.append({"label": label, "geometry": geometry, "properties": {"source": "current"}})
+        for part_index, geometry in enumerate(geometry_parts(row.geometry), start=1):
+            if geometry is None or geometry.is_empty:
+                continue
+            items.append(
+                {
+                    "label": label,
+                    "part_index": part_index,
+                    "geometry": geometry,
+                    "properties": {"source": "current_part"},
+                }
+            )
     return items
 
 
@@ -3105,6 +3112,32 @@ def safe_geometry(geometry: Any) -> Any:
     except Exception:
         return geometry
     return geometry
+
+
+def combined_plan_items(part_items: list[dict[str, Any]], source: str = "current") -> list[dict[str, Any]]:
+    """Group polygon parts into one proposed-plan item per district label."""
+    grouped: dict[str, list[Any]] = {}
+    for item in part_items:
+        geometry = safe_geometry(item.get("geometry"))
+        if geometry is None or geometry.is_empty:
+            continue
+        grouped.setdefault(item["label"], []).append(geometry)
+
+    items = []
+    for label in sorted(grouped, key=natural_sort_key):
+        try:
+            geometry = safe_geometry(unary_union(grouped[label]))
+        except Exception:
+            geometry = safe_geometry(grouped[label][0])
+        if geometry is None or geometry.is_empty:
+            continue
+        items.append({"label": label, "geometry": geometry, "properties": {"source": source}})
+    return items
+
+
+def current_plan_items(gdf: gpd.GeoDataFrame, simplify: bool = False) -> list[dict[str, Any]]:
+    """Convert current district geometries into proposed-plan item objects."""
+    return combined_plan_items(current_plan_part_items(gdf, simplify), "current")
 
 
 def geometry_parts(geometry: Any) -> list[Any]:
@@ -3149,30 +3182,29 @@ def geometry_change_share(reference_geometry: Any, edited_geometry: Any) -> floa
     return changed_area / reference_area
 
 
-def align_edited_items_to_current_labels(
+def align_edited_parts_to_current_labels(
     edited_items: list[dict[str, Any]],
-    baseline_items: list[dict[str, Any]],
+    baseline_part_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep edited browser features attached to the district labels loaded into the edit map."""
-    baseline_labels = [item["label"] for item in baseline_items]
+    """Keep edited browser polygon parts attached to the district labels loaded into the edit map."""
+    baseline_labels = [item["label"] for item in baseline_part_items]
     baseline_label_set = set(baseline_labels)
-    aligned = []
-    used_labels: set[str] = set()
+    aligned_parts = []
     for index, item in enumerate(edited_items):
         label = str(item.get("label") or "")
         if label not in baseline_label_set and index < len(baseline_labels):
             label = baseline_labels[index]
-        if label in used_labels:
+        if label not in baseline_label_set:
             continue
-        used_labels.add(label)
-        aligned.append(
+        aligned_parts.append(
             {
                 "label": label,
+                "part_index": index + 1,
                 "geometry": safe_geometry(item.get("geometry")),
                 "properties": item.get("properties") or {},
             }
         )
-    return aligned
+    return combined_plan_items(aligned_parts, "edited_parts")
 
 
 def best_recipient_for_lost_piece(
@@ -3309,6 +3341,7 @@ def edited_current_plan_items(
     session_key: str,
     current_items: list[dict[str, Any]],
     baseline_items: list[dict[str, Any]],
+    baseline_part_items: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Read edited current-plan polygons from streamlit-folium and repair them into one plan."""
     if draw_output and draw_output.get("all_drawings"):
@@ -3319,10 +3352,25 @@ def edited_current_plan_items(
         return current_items, []
 
     edited_items = proposed_geometries_from_geojson({"type": "FeatureCollection", "features": drawings})
-    aligned_items = align_edited_items_to_current_labels(edited_items, baseline_items)
+    aligned_items = align_edited_parts_to_current_labels(edited_items, baseline_part_items)
     if not aligned_items:
         return current_items, []
     return apply_topology_preserving_edits(current_items, baseline_items, aligned_items)
+
+
+def ring_to_leaflet_locations(ring: Any) -> list[tuple[float, float]]:
+    """Convert a Shapely ring from lon/lat into Leaflet lat/lon tuples."""
+    return [(float(lat), float(lon)) for lon, lat in ring.coords]
+
+
+def polygon_to_leaflet_locations(geometry: Any) -> list[Any]:
+    """Convert one Shapely polygon into Leaflet polygon locations."""
+    geometry = safe_geometry(geometry)
+    if geometry is None or geometry.is_empty or geometry.geom_type != "Polygon":
+        return []
+    rings = [ring_to_leaflet_locations(geometry.exterior)]
+    rings.extend(ring_to_leaflet_locations(interior) for interior in geometry.interiors)
+    return rings[0] if len(rings) == 1 else rings
 
 
 def create_editable_current_plan_map(
@@ -3338,20 +3386,21 @@ def create_editable_current_plan_map(
         tiles="cartodbdark_matter",
         control_scale=True,
     )
-    editable_gdf = current_plan_gdf(district_gdf, simplify)
-    editable_layer = folium.GeoJson(
-        data=geojson_dict(editable_gdf),
-        name="Editable Current Districts",
-        tooltip=folium.GeoJsonTooltip(fields=["proposal_label"], aliases=["District"]),
-        style_function=lambda _: {
-            "fillOpacity": 0.14,
-            "fillColor": "#38bdf8",
-            "color": "#f8fafc",
-            "weight": 1.7,
-            "opacity": 0.95,
-        },
-        highlight_function=lambda _: {"weight": 2.8, "color": "#facc15", "fillOpacity": 0.24},
-    )
+    editable_layer = folium.FeatureGroup(name="Editable Current Districts")
+    for item in current_plan_part_items(district_gdf, simplify):
+        locations = polygon_to_leaflet_locations(item["geometry"])
+        if not locations:
+            continue
+        folium.Polygon(
+            locations=locations,
+            tooltip=f"District {item['label']}",
+            color="#f8fafc",
+            weight=1.7,
+            opacity=0.95,
+            fill=True,
+            fill_color="#38bdf8",
+            fill_opacity=0.14,
+        ).add_to(editable_layer)
     editable_layer.add_to(map_object)
     Draw(
         export=False,
@@ -3773,13 +3822,14 @@ def display_proposed_plan_mode(
     if plan_mode == "Edit current boundaries":
         edit_session_key = f"{state_name}_editable_current_plan_features"
         current_items = current_plan_items(district_gdf, simplify=False)
-        baseline_items = current_plan_items(district_gdf, simplify=simplify)
+        baseline_part_items = current_plan_part_items(district_gdf, simplify=simplify)
+        baseline_items = combined_plan_items(baseline_part_items, "editable_baseline")
 
         if st.button("Reset boundary edits", key=f"{state_name}_reset_editable_boundaries"):
             st.session_state.pop(edit_session_key, None)
 
         st.caption(
-            "Use the map edit tool, drag district boundary vertices, then save the edit in the map toolbar. "
+            "Use the map pencil/edit tool, drag the small square boundary vertices, then save the edit in the map toolbar. "
             "The app repairs the changed area into neighboring districts and updates the plan summary below."
         )
         edit_map = create_editable_current_plan_map(district_gdf, state_name, simplify)
@@ -3795,6 +3845,7 @@ def display_proposed_plan_mode(
             edit_session_key,
             current_items,
             baseline_items,
+            baseline_part_items,
         )
         if changed_labels:
             label_text = ", ".join(changed_labels[:12])

@@ -58,7 +58,7 @@ Congressional district view includes a district scorecard for California and Lou
 
 ## Proposed Plan Mode
 
-Congressional district view also includes proposed plan mode. Edit current district boundaries directly on the map, draw multiple proposed districts, or upload a GeoJSON FeatureCollection. The app repairs edited boundary changes into a same-size proposed plan, checks for gaps/overlaps, and estimates vote share, turnout, CVAP demographics, compactness, and overlap with current districts. The plan summary compares estimated outcomes against the current plan, including seats, competitiveness, majority-minority CVAP districts, compactness, and turnout. Estimates are approximate because they are area-weighted from the current congressional district layer.
+Congressional district view also includes proposed plan mode. Edit current district boundaries directly on the map with the pencil tool and draggable boundary vertices, draw multiple proposed districts, or upload a GeoJSON FeatureCollection. The app repairs edited boundary changes into a same-size proposed plan, checks for gaps/overlaps, and estimates vote share, turnout, CVAP demographics, compactness, and overlap with current districts. The plan summary compares estimated outcomes against the current plan, including seats, competitiveness, majority-minority CVAP districts, compactness, and turnout. Estimates are approximate because they are area-weighted from the current congressional district layer.
 
 ## Redistricting Metrics
 
