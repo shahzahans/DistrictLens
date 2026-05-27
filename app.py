@@ -37,7 +37,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-27 fairness-metrics-html-map"
+APP_VERSION = "2026-05-27 numeric-fairness-metrics"
 
 STATE_CONFIG = {
     "California": {
@@ -4346,46 +4346,138 @@ def display_state_comparison() -> None:
         st.dataframe(display_table, hide_index=True, use_container_width=True, height=table_height)
 
 
-def display_california_interactive_redistricting_map() -> None:
-    """Embed the local California interactive HTML map when it is available."""
-    st.subheader("Fairness Metrics")
-    fairness_metrics = pd.DataFrame(
+def population_metric_column(gdf: gpd.GeoDataFrame) -> str | None:
+    """Find a likely total population column when one exists."""
+    population_names = {
+        "population",
+        "totalpopulation",
+        "totalpop",
+        "totpop",
+        "pop",
+        "persons",
+        "p0010001",
+    }
+    for column in gdf.columns:
+        if column == "geometry":
+            continue
+        if clean_name(column) in population_names:
+            values = safe_numeric(gdf[column])
+            if values.notna().any():
+                return column
+    return None
+
+
+def california_fairness_metrics_table(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Calculate numeric fairness metrics from the loaded California district layer."""
+    district_count = len(gdf)
+    winner_margin = safe_numeric(gdf.get("winner_margin", pd.Series(dtype="float64"))).dropna()
+    compactness = safe_numeric(gdf.get("compactness_polsby_popper", pd.Series(dtype="float64"))).dropna()
+    minority_cvap = safe_numeric(gdf.get("minority_cvap_pct", pd.Series(dtype="float64"))).dropna()
+
+    population_column = population_metric_column(gdf)
+    if population_column:
+        population = safe_numeric(gdf[population_column]).dropna()
+        ideal_population = population.mean()
+        max_deviation = (population.sub(ideal_population).abs() / ideal_population).max() if ideal_population else np.nan
+        population_value = f"Max deviation {format_percent(max_deviation)}"
+        population_note = f"Ideal district population {format_number(ideal_population)} from {population_column}"
+    else:
+        population_value = "Not available"
+        population_note = "No total population column in deployed data; legal target is <= 1% deviation"
+
+    part_counts = [len(geometry_parts(geometry)) for geometry in gdf.geometry]
+    single_part_count = sum(1 for count in part_counts if count == 1)
+    multipart_count = district_count - single_part_count
+
+    compactness_value = "Not available"
+    compactness_note = "Not calculated yet"
+    if not compactness.empty:
+        compactness_value = f"Average {format_decimal_score(compactness.mean())}"
+        compactness_note = (
+            f"Min {format_decimal_score(compactness.min())}; "
+            f"max {format_decimal_score(compactness.max())}; algorithm setting = 1"
+        )
+
+    majority_minority_value = "Not available"
+    majority_minority_note = "Minority CVAP data missing"
+    if not minority_cvap.empty:
+        majority_count = int((minority_cvap >= 0.50).sum())
+        majority_minority_value = f"{majority_count}/{district_count} districts"
+        majority_minority_note = (
+            f"Average minority CVAP {format_percent(minority_cvap.mean())}; "
+            f"max {format_percent(minority_cvap.max())}"
+        )
+
+    packing_value = "Not available"
+    packing_note = "Needs visual review"
+    competitiveness_value = "Not available"
+    competitiveness_note = "Count not calculated yet"
+    if not winner_margin.empty:
+        safe_seats = int((winner_margin >= 0.20).sum())
+        landslide_seats = int((winner_margin >= 0.50).sum())
+        highly_competitive = int((winner_margin <= 0.01).sum())
+        competitive_10 = int((winner_margin <= 0.10).sum())
+        packing_value = f"{safe_seats}/{district_count} seats >= 20 pp margin"
+        if not minority_cvap.empty:
+            high_minority = int((minority_cvap >= 0.70).sum())
+            packing_note = f"{landslide_seats} seats >= 50 pp margin; {high_minority} districts >= 70% minority CVAP"
+        else:
+            packing_note = f"{landslide_seats} seats >= 50 pp margin"
+        competitiveness_value = f"{highly_competitive}/{district_count} districts within 0-1%"
+        competitiveness_note = (
+            f"{competitive_10} districts within 10%; "
+            f"closest margin {format_percentage_points(winner_margin.min())}"
+        )
+
+    return pd.DataFrame(
         [
             {
                 "Metric": "Population Balance",
-                "What It Checks": "District populations should not vary by more than 1%.",
-                "Current Status": "District population deviation <= 1%",
+                "Value": population_value,
+                "Status / Detail": population_note,
             },
             {
                 "Metric": "Contiguity",
-                "What It Checks": "Each district should be geographically connected.",
-                "Current Status": "Contiguous: Not calculated yet",
+                "Value": f"{single_part_count}/{district_count} single-part districts",
+                "Status / Detail": f"{multipart_count} multipart districts in strict geometry check",
             },
             {
                 "Metric": "Compactness",
-                "What It Checks": "Higher compactness discourages stretched or oddly shaped districts.",
-                "Current Status": "Compactness = 1",
+                "Value": compactness_value,
+                "Status / Detail": compactness_note,
             },
             {
                 "Metric": "Minority CVAP / Majority-Minority",
-                "What It Checks": "Checks whether there is majority-minority voting-age or CVAP representation.",
-                "Current Status": "Majority-minority district: Not calculated yet",
+                "Value": majority_minority_value,
+                "Status / Detail": majority_minority_note,
             },
             {
-                "Metric": "Packing / Cracking",
-                "What It Checks": "Looks for elongated districts and possible concentration or splitting of groups.",
-                "Current Status": "Needs visual review",
+                "Metric": "Packing / Cracking Proxy",
+                "Value": packing_value,
+                "Status / Detail": packing_note,
             },
             {
                 "Metric": "Competitiveness",
-                "What It Checks": "Districts with 0-1% winning margin are highly competitive.",
-                "Current Status": "Competitive districts: Count not calculated yet",
+                "Value": competitiveness_value,
+                "Status / Detail": competitiveness_note,
             },
         ]
     )
+
+
+def display_california_interactive_redistricting_map(gdf: gpd.GeoDataFrame) -> None:
+    """Embed the local California interactive HTML map when it is available."""
+    st.subheader("Fairness Metrics")
+    fairness_metrics = california_fairness_metrics_table(gdf)
+    metric_columns = st.columns(4)
+    metric_lookup = fairness_metrics.set_index("Metric")["Value"].to_dict()
+    metric_columns[0].metric("Compactness", metric_lookup.get("Compactness", "Not available"))
+    metric_columns[1].metric("Majority-Minority", metric_lookup.get("Minority CVAP / Majority-Minority", "Not available"))
+    metric_columns[2].metric("Highly Competitive", metric_lookup.get("Competitiveness", "Not available"))
+    metric_columns[3].metric("Contiguity", metric_lookup.get("Contiguity", "Not available"))
     st.table(fairness_metrics)
     st.caption(
-        "These metrics help evaluate whether the proposed district plan is balanced, compact, representative, and competitive."
+        "Numeric metrics are calculated from the loaded California district layer. Population balance is shown only when a total population field is available."
     )
 
     st.subheader("California Interactive Redistricting Map")
@@ -4658,7 +4750,7 @@ def main() -> None:
         display_state_comparison()
         display_proposed_plan_mode(active_gdf, state_name, simplify)
         if state_name == "California":
-            display_california_interactive_redistricting_map()
+            display_california_interactive_redistricting_map(active_gdf)
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
