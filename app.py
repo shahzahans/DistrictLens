@@ -37,7 +37,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-27 embedded-ca-html-map"
+APP_VERSION = "2026-05-27 fairness-metrics-html-map"
 
 STATE_CONFIG = {
     "California": {
@@ -4348,6 +4348,46 @@ def display_state_comparison() -> None:
 
 def display_california_interactive_redistricting_map() -> None:
     """Embed the local California interactive HTML map when it is available."""
+    st.subheader("Fairness Metrics")
+    fairness_metrics = pd.DataFrame(
+        [
+            {
+                "Metric": "Population Balance",
+                "What It Checks": "District populations should not vary by more than 1%.",
+                "Current Status": "District population deviation <= 1%",
+            },
+            {
+                "Metric": "Contiguity",
+                "What It Checks": "Each district should be geographically connected.",
+                "Current Status": "Contiguous: Not calculated yet",
+            },
+            {
+                "Metric": "Compactness",
+                "What It Checks": "Higher compactness discourages stretched or oddly shaped districts.",
+                "Current Status": "Compactness = 1",
+            },
+            {
+                "Metric": "Minority CVAP / Majority-Minority",
+                "What It Checks": "Checks whether there is majority-minority voting-age or CVAP representation.",
+                "Current Status": "Majority-minority district: Not calculated yet",
+            },
+            {
+                "Metric": "Packing / Cracking",
+                "What It Checks": "Looks for elongated districts and possible concentration or splitting of groups.",
+                "Current Status": "Needs visual review",
+            },
+            {
+                "Metric": "Competitiveness",
+                "What It Checks": "Districts with 0-1% winning margin are highly competitive.",
+                "Current Status": "Competitive districts: Count not calculated yet",
+            },
+        ]
+    )
+    st.table(fairness_metrics)
+    st.caption(
+        "These metrics help evaluate whether the proposed district plan is balanced, compact, representative, and competitive."
+    )
+
     st.subheader("California Interactive Redistricting Map")
     html_path = BASE_DIR / "mapca_plan1_interactive.html"
 
