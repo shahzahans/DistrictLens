@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html as html_lib
 import re
 import shutil
 import warnings as python_warnings
@@ -18,7 +19,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from folium.plugins import Draw
 from pandas.errors import PerformanceWarning
-from shapely.geometry import shape
+from shapely.geometry import MultiPolygon, Polygon, shape
 from shapely.errors import GEOSException
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
@@ -37,7 +38,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-27 numeric-fairness-metrics"
+APP_VERSION = "2026-05-27 plan-html-fairness-metrics"
 
 STATE_CONFIG = {
     "California": {
@@ -4346,140 +4347,314 @@ def display_state_comparison() -> None:
         st.dataframe(display_table, hide_index=True, use_container_width=True, height=table_height)
 
 
-def population_metric_column(gdf: gpd.GeoDataFrame) -> str | None:
-    """Find a likely total population column when one exists."""
-    population_names = {
-        "population",
-        "totalpopulation",
-        "totalpop",
-        "totpop",
-        "pop",
-        "persons",
-        "p0010001",
+def parse_tmap_popup_value(value: Any) -> Any:
+    """Convert tmap popup cell text into a number when possible."""
+    text = html_lib.unescape(str(value)).strip()
+    if not text or text.lower() == "missing":
+        return np.nan
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        return text
+
+
+def parse_tmap_popup_record(popup_html: str) -> dict[str, Any]:
+    """Extract district attributes from one tmap popup table."""
+    pairs = re.findall(
+        r"<nobr>(.*?)</nobr>\s*</td><td[^>]*>\s*<nobr>(.*?)</nobr>",
+        popup_html,
+        flags=re.S,
+    )
+    return {
+        html_lib.unescape(key).strip(): parse_tmap_popup_value(value)
+        for key, value in pairs
     }
-    for column in gdf.columns:
-        if column == "geometry":
+
+
+def tmap_ring_coordinates(ring_data: dict[str, list[float]]) -> list[tuple[float, float]]:
+    """Convert Leaflet/tmap separate lng/lat arrays into Shapely coordinates."""
+    coordinates = [
+        (float(lng), float(lat))
+        for lng, lat in zip(ring_data.get("lng", []), ring_data.get("lat", []))
+    ]
+    if len(coordinates) < 3:
+        return []
+    if coordinates[0] != coordinates[-1]:
+        coordinates.append(coordinates[0])
+    return coordinates
+
+
+def tmap_polygon_geometry(raw_feature: Any) -> Any:
+    """Build a Polygon or MultiPolygon from a tmap addPolygons feature."""
+    polygons: list[Any] = []
+    for raw_polygon in raw_feature or []:
+        if not raw_polygon:
             continue
-        if clean_name(column) in population_names:
-            values = safe_numeric(gdf[column])
-            if values.notna().any():
-                return column
-    return None
+        exterior = tmap_ring_coordinates(raw_polygon[0])
+        if len(exterior) < 4:
+            continue
+        holes = [
+            hole
+            for hole in (tmap_ring_coordinates(raw_ring) for raw_ring in raw_polygon[1:])
+            if len(hole) >= 4
+        ]
+        try:
+            polygon = safe_geometry(Polygon(exterior, holes))
+        except (TypeError, ValueError, GEOSException):
+            continue
+        if polygon is None or polygon.is_empty:
+            continue
+        if polygon.geom_type == "Polygon":
+            polygons.append(polygon)
+        elif polygon.geom_type == "MultiPolygon":
+            polygons.extend([part for part in polygon.geoms if not part.is_empty])
+
+    if not polygons:
+        return None
+    if len(polygons) == 1:
+        return polygons[0]
+    return MultiPolygon(polygons)
 
 
-def california_fairness_metrics_table(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
-    """Calculate numeric fairness metrics from the loaded California district layer."""
-    district_count = len(gdf)
-    winner_margin = safe_numeric(gdf.get("winner_margin", pd.Series(dtype="float64"))).dropna()
-    compactness = safe_numeric(gdf.get("compactness_polsby_popper", pd.Series(dtype="float64"))).dropna()
-    minority_cvap = safe_numeric(gdf.get("minority_cvap_pct", pd.Series(dtype="float64"))).dropna()
+def extract_tmap_widget_payload(html_content: str) -> dict[str, Any]:
+    """Read the embedded htmlwidget JSON from the saved tmap HTML file."""
+    match = re.search(
+        r'<script type="application/json" data-for="[^"]+">(.*?)</script>',
+        html_content,
+        flags=re.S,
+    )
+    if not match:
+        raise ValueError("No embedded tmap JSON was found.")
+    return json.loads(match.group(1))
 
-    population_column = population_metric_column(gdf)
+
+def find_tmap_plan_polygon_call(widget_payload: dict[str, Any]) -> dict[str, Any]:
+    """Find the addPolygons call that contains the California plan data."""
+    polygon_calls = [
+        call
+        for call in widget_payload.get("x", {}).get("calls", [])
+        if call.get("method") == "addPolygons" and len(call.get("args", [])) >= 5
+    ]
+    for call in polygon_calls:
+        if call["args"][2] == "mapca_plan1_vote":
+            return call
+    for call in polygon_calls:
+        if isinstance(call["args"][4], list) and call["args"][4]:
+            return call
+    raise ValueError("No district polygon layer with popup metrics was found.")
+
+
+def normalized_share(series: pd.Series) -> pd.Series:
+    """Return share values on a 0-1 scale even when source data is 0-100."""
+    values = safe_numeric(series)
+    return values.where(values <= 1.5, values / 100)
+
+
+def format_party_margin(value: Any) -> str:
+    margin = safe_numeric(pd.Series([value])).iloc[0]
+    if pd.isna(margin):
+        return "Not available"
+    party = "D" if margin >= 0 else "R"
+    return f"{party} +{abs(margin) * 100:.1f} pp"
+
+
+def plan_population_metric(plan_df: pd.DataFrame) -> tuple[str, str]:
+    """Calculate actual population balance when the exported map includes population."""
+    population_names = {"population", "totalpopulation", "totalpop", "totpop", "pop", "apop", "persons", "p0010001"}
+    population_column = next(
+        (
+            column
+            for column in plan_df.columns
+            if clean_name(column) in population_names and safe_numeric(plan_df[column]).notna().any()
+        ),
+        None,
+    )
     if population_column:
-        population = safe_numeric(gdf[population_column]).dropna()
+        population = safe_numeric(plan_df[population_column]).dropna()
         ideal_population = population.mean()
-        max_deviation = (population.sub(ideal_population).abs() / ideal_population).max() if ideal_population else np.nan
-        population_value = f"Max deviation {format_percent(max_deviation)}"
-        population_note = f"Ideal district population {format_number(ideal_population)} from {population_column}"
-    else:
-        population_value = "Not available"
-        population_note = "No total population column in deployed data; legal target is <= 1% deviation"
-
-    part_counts = [len(geometry_parts(geometry)) for geometry in gdf.geometry]
-    single_part_count = sum(1 for count in part_counts if count == 1)
-    multipart_count = district_count - single_part_count
-
-    compactness_value = "Not available"
-    compactness_note = "Not calculated yet"
-    if not compactness.empty:
-        compactness_value = f"Average {format_decimal_score(compactness.mean())}"
-        compactness_note = (
-            f"Min {format_decimal_score(compactness.min())}; "
-            f"max {format_decimal_score(compactness.max())}; algorithm setting = 1"
+        max_deviation = (
+            population.sub(ideal_population).abs().div(ideal_population).max()
+            if ideal_population
+            else np.nan
+        )
+        return (
+            f"Max deviation {format_percent(max_deviation)}",
+            f"Ideal {format_number(ideal_population)}; min {format_number(population.min())}; max {format_number(population.max())}",
         )
 
-    majority_minority_value = "Not available"
-    majority_minority_note = "Minority CVAP data missing"
-    if not minority_cvap.empty:
-        majority_count = int((minority_cvap >= 0.50).sum())
-        majority_minority_value = f"{majority_count}/{district_count} districts"
-        majority_minority_note = (
-            f"Average minority CVAP {format_percent(minority_cvap.mean())}; "
-            f"max {format_percent(minority_cvap.max())}"
-        )
+    total_vap = safe_numeric(plan_df.get("total_vap", pd.Series(dtype="float64"))).dropna()
+    if total_vap.empty:
+        return "1.0% target", "total_pop not exported in HTML"
+    ideal_vap = total_vap.mean()
+    vap_deviation = total_vap.sub(ideal_vap).abs().div(ideal_vap).max() if ideal_vap else np.nan
+    return (
+        "1.0% target",
+        f"total_pop not exported; VAP max deviation {format_percent(vap_deviation)}",
+    )
 
-    packing_value = "Not available"
-    packing_note = "Needs visual review"
-    competitiveness_value = "Not available"
-    competitiveness_note = "Count not calculated yet"
-    if not winner_margin.empty:
-        safe_seats = int((winner_margin >= 0.20).sum())
-        landslide_seats = int((winner_margin >= 0.50).sum())
-        highly_competitive = int((winner_margin <= 0.01).sum())
-        competitive_10 = int((winner_margin <= 0.10).sum())
-        packing_value = f"{safe_seats}/{district_count} seats >= 20 pp margin"
-        if not minority_cvap.empty:
-            high_minority = int((minority_cvap >= 0.70).sum())
-            packing_note = f"{landslide_seats} seats >= 50 pp margin; {high_minority} districts >= 70% minority CVAP"
-        else:
-            packing_note = f"{landslide_seats} seats >= 50 pp margin"
-        competitiveness_value = f"{highly_competitive}/{district_count} districts within 0-1%"
-        competitiveness_note = (
-            f"{competitive_10} districts within 10%; "
-            f"closest margin {format_percentage_points(winner_margin.min())}"
-        )
 
-    return pd.DataFrame(
+def build_california_plan_metric_tables(
+    plan_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    """Build numeric fairness tables from the saved California interactive map data."""
+    district_count = len(plan_df)
+    signed_margin = safe_numeric(plan_df.get("margin_pct", pd.Series(dtype="float64")))
+    winner_margin = signed_margin.abs().dropna()
+    total_dem = safe_numeric(plan_df.get("total_dem", pd.Series(dtype="float64"))).sum()
+    total_rep = safe_numeric(plan_df.get("total_rep", pd.Series(dtype="float64"))).sum()
+    two_party_total = total_dem + total_rep
+    democratic_seats = int((signed_margin > 0).sum())
+    republican_seats = int((signed_margin < 0).sum())
+
+    compactness = safe_numeric(plan_df.get("compactness_polsby_popper", pd.Series(dtype="float64"))).dropna()
+    geometry_parts_count = safe_numeric(plan_df.get("geometry_part_count", pd.Series(dtype="float64"))).dropna()
+    single_part_count = int((geometry_parts_count == 1).sum()) if not geometry_parts_count.empty else 0
+    multipart_count = int((geometry_parts_count > 1).sum()) if not geometry_parts_count.empty else 0
+
+    white_vap = normalized_share(plan_df.get("pct_vap_white", pd.Series(dtype="float64")))
+    nonwhite_vap = (1 - white_vap).dropna()
+    majority_minority_count = int((nonwhite_vap >= 0.50).sum()) if not nonwhite_vap.empty else 0
+    hba_vap = (
+        normalized_share(plan_df.get("pct_vap_hisp", pd.Series(dtype="float64")))
+        + normalized_share(plan_df.get("pct_vap_black", pd.Series(dtype="float64")))
+        + normalized_share(plan_df.get("pct_vap_asian", pd.Series(dtype="float64")))
+    ).dropna()
+    hba_majority_count = int((hba_vap >= 0.50).sum()) if not hba_vap.empty else 0
+
+    highly_competitive = int((winner_margin <= 0.01).sum()) if not winner_margin.empty else 0
+    competitive_5 = int((winner_margin <= 0.05).sum()) if not winner_margin.empty else 0
+    competitive_10 = int((winner_margin <= 0.10).sum()) if not winner_margin.empty else 0
+    safe_20 = int((winner_margin >= 0.20).sum()) if not winner_margin.empty else 0
+    landslide_50 = int((winner_margin >= 0.50).sum()) if not winner_margin.empty else 0
+
+    population_value, population_detail = plan_population_metric(plan_df)
+    compactness_value = f"Average {format_decimal_score(compactness.mean())}" if not compactness.empty else "Not available"
+    compactness_detail = (
+        f"Min {format_decimal_score(compactness.min())}; max {format_decimal_score(compactness.max())}; setting 1.0"
+        if not compactness.empty
+        else "Not available"
+    )
+    outcome_detail = (
+        f"D two-party share {format_percent(total_dem / two_party_total)}; total D+R votes {format_number(two_party_total)}"
+        if two_party_total
+        else "Not available"
+    )
+
+    metrics_df = pd.DataFrame(
         [
             {
                 "Metric": "Population Balance",
                 "Value": population_value,
-                "Status / Detail": population_note,
+                "Detail": population_detail,
             },
             {
-                "Metric": "Contiguity",
-                "Value": f"{single_part_count}/{district_count} single-part districts",
-                "Status / Detail": f"{multipart_count} multipart districts in strict geometry check",
+                "Metric": "Partisan Outcome",
+                "Value": f"{democratic_seats} D / {republican_seats} R",
+                "Detail": outcome_detail,
+            },
+            {
+                "Metric": "Competitiveness",
+                "Value": f"{highly_competitive}/{district_count} within 0-1%",
+                "Detail": f"{competitive_5} within 5%; {competitive_10} within 10%; closest {format_percentage_points(winner_margin.min())}",
+            },
+            {
+                "Metric": "Packing / Cracking Proxy",
+                "Value": f"{safe_20}/{district_count} seats >= 20 pp",
+                "Detail": f"{landslide_50} seats >= 50 pp; average margin {format_percentage_points(winner_margin.mean())}",
+            },
+            {
+                "Metric": "Majority-Minority VAP",
+                "Value": f"{majority_minority_count}/{district_count} nonwhite VAP majority",
+                "Detail": f"{hba_majority_count}/{district_count} Hispanic+Black+Asian VAP majority; average nonwhite VAP {format_percent(nonwhite_vap.mean())}",
             },
             {
                 "Metric": "Compactness",
                 "Value": compactness_value,
-                "Status / Detail": compactness_note,
+                "Detail": compactness_detail,
             },
             {
-                "Metric": "Minority CVAP / Majority-Minority",
-                "Value": majority_minority_value,
-                "Status / Detail": majority_minority_note,
-            },
-            {
-                "Metric": "Packing / Cracking Proxy",
-                "Value": packing_value,
-                "Status / Detail": packing_note,
-            },
-            {
-                "Metric": "Competitiveness",
-                "Value": competitiveness_value,
-                "Status / Detail": competitiveness_note,
+                "Metric": "Contiguity",
+                "Value": f"{single_part_count}/{district_count} single-part",
+                "Detail": f"{multipart_count} multipart geometries",
             },
         ]
     )
 
-
-def display_california_interactive_redistricting_map(gdf: gpd.GeoDataFrame) -> None:
-    """Embed the local California interactive HTML map when it is available."""
-    st.subheader("Fairness Metrics")
-    fairness_metrics = california_fairness_metrics_table(gdf)
-    metric_columns = st.columns(4)
-    metric_lookup = fairness_metrics.set_index("Metric")["Value"].to_dict()
-    metric_columns[0].metric("Compactness", metric_lookup.get("Compactness", "Not available"))
-    metric_columns[1].metric("Majority-Minority", metric_lookup.get("Minority CVAP / Majority-Minority", "Not available"))
-    metric_columns[2].metric("Highly Competitive", metric_lookup.get("Competitiveness", "Not available"))
-    metric_columns[3].metric("Contiguity", metric_lookup.get("Contiguity", "Not available"))
-    st.table(fairness_metrics)
-    st.caption(
-        "Numeric metrics are calculated from the loaded California district layer. Population balance is shown only when a total population field is available."
+    district_numbers = safe_numeric(plan_df.get("district", pd.Series(dtype="float64")))
+    district_table = pd.DataFrame(
+        {
+            "District": district_numbers.map(lambda value: format_number(value)),
+            "Winner": signed_margin.map(lambda value: "Not available" if pd.isna(value) else ("D" if value >= 0 else "R")),
+            "Margin": signed_margin.map(format_party_margin),
+            "D Votes": safe_numeric(plan_df.get("total_dem", pd.Series(dtype="float64"))).map(format_number),
+            "R Votes": safe_numeric(plan_df.get("total_rep", pd.Series(dtype="float64"))).map(format_number),
+            "Total Votes": safe_numeric(plan_df.get("total_votes", pd.Series(dtype="float64"))).map(format_number),
+            "Nonwhite VAP": nonwhite_vap.reindex(plan_df.index).map(format_percent),
+            "Compactness": compactness.reindex(plan_df.index).map(format_decimal_score),
+            "Margin Bin": plan_df.get("margin_bin", pd.Series("", index=plan_df.index)),
+            "_district_sort": district_numbers,
+        }
     )
+    district_table = district_table.sort_values("_district_sort").drop(columns="_district_sort")
 
+    summary_cards = {
+        "seats": f"{democratic_seats} D / {republican_seats} R",
+        "avg_margin": format_percentage_points(winner_margin.mean()),
+        "competitive": f"{highly_competitive}/{district_count}",
+        "compactness": format_decimal_score(compactness.mean()),
+    }
+    return metrics_df, district_table, summary_cards
+
+
+@st.cache_data(show_spinner=False)
+def load_california_interactive_plan_metrics(
+    html_path_text: str,
+    modified_ns: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
+    """Calculate fairness metrics from the embedded California tmap HTML file."""
+    html_content = Path(html_path_text).read_text(encoding="utf-8")
+    widget_payload = extract_tmap_widget_payload(html_content)
+    polygon_call = find_tmap_plan_polygon_call(widget_payload)
+    raw_geometries, ids, _, options, popups = polygon_call["args"][:5]
+
+    records: list[dict[str, Any]] = []
+    geometries: list[Any] = []
+    fill_colors = options.get("fillColor", []) if isinstance(options, dict) else []
+    for index, popup_html in enumerate(popups):
+        record = parse_tmap_popup_record(popup_html)
+        record["_feature_id"] = ids[index] if index < len(ids) else index + 1
+        record["fill_color"] = fill_colors[index] if index < len(fill_colors) else ""
+        records.append(record)
+        geometries.append(tmap_polygon_geometry(raw_geometries[index]))
+
+    plan_gdf = gpd.GeoDataFrame(records, geometry=geometries, crs=4326)
+    plan_df = pd.DataFrame(plan_gdf.drop(columns="geometry"))
+    plan_df["geometry_part_count"] = [
+        len(geometry_parts(geometry)) if geometry is not None else 0
+        for geometry in plan_gdf.geometry
+    ]
+
+    valid_geometry = plan_gdf[plan_gdf.geometry.notna() & ~plan_gdf.geometry.is_empty]
+    if not valid_geometry.empty:
+        projected = projected_area_gdf(valid_geometry[["geometry"]].copy())
+        area = projected.area
+        perimeter = projected.length.replace(0, np.nan)
+        compactness = 4 * np.pi * area / (perimeter**2)
+        plan_df.loc[valid_geometry.index, "compactness_polsby_popper"] = compactness
+
+    district_sort = safe_numeric(plan_df.get("district", pd.Series(dtype="float64")))
+    if district_sort.notna().any():
+        plan_df = (
+            plan_df.assign(_district_sort=district_sort)
+            .sort_values("_district_sort")
+            .drop(columns="_district_sort")
+        )
+
+    return build_california_plan_metric_tables(plan_df)
+
+
+def display_california_interactive_redistricting_map() -> None:
+    """Embed the local California interactive HTML map and calculate its plan metrics."""
     st.subheader("California Interactive Redistricting Map")
     html_path = BASE_DIR / "mapca_plan1_interactive.html"
 
@@ -4488,12 +4663,37 @@ def display_california_interactive_redistricting_map(gdf: gpd.GeoDataFrame) -> N
         return
 
     try:
+        html_modified_ns = html_path.stat().st_mtime_ns
         html_content = html_path.read_text(encoding="utf-8")
     except OSError as exc:
         st.error(f"California map file could not be read: {exc}")
         return
 
     components.html(html_content, height=800, scrolling=True)
+
+    st.subheader("Fairness Metrics")
+    try:
+        fairness_metrics, district_table, summary_cards = load_california_interactive_plan_metrics(
+            str(html_path),
+            html_modified_ns,
+        )
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        st.error(f"California plan metrics could not be calculated from the HTML map: {exc}")
+        return
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Plan Seats", summary_cards.get("seats", "Not available"))
+    metric_columns[1].metric("Average Margin", summary_cards.get("avg_margin", "Not available"))
+    metric_columns[2].metric("0-1% Districts", summary_cards.get("competitive", "Not available"))
+    metric_columns[3].metric("Avg Compactness", summary_cards.get("compactness", "Not available"))
+    st.table(fairness_metrics)
+
+    with st.expander("District-Level Numbers From The Interactive Map"):
+        st.dataframe(district_table, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "Calculated from mapca_plan1_interactive.html. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
+    )
 
 
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
@@ -4750,7 +4950,7 @@ def main() -> None:
         display_state_comparison()
         display_proposed_plan_mode(active_gdf, state_name, simplify)
         if state_name == "California":
-            display_california_interactive_redistricting_map(active_gdf)
+            display_california_interactive_redistricting_map()
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
