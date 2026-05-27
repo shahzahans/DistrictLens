@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import pyogrio
 import streamlit as st
+import streamlit.components.v1 as components
 from folium.plugins import Draw
 from pandas.errors import PerformanceWarning
 from shapely.geometry import shape
@@ -36,7 +37,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-20 automatic-boundary-adjustment"
+APP_VERSION = "2026-05-27 embedded-ca-html-map"
 
 STATE_CONFIG = {
     "California": {
@@ -4345,6 +4346,24 @@ def display_state_comparison() -> None:
         st.dataframe(display_table, hide_index=True, use_container_width=True, height=table_height)
 
 
+def display_california_interactive_redistricting_map() -> None:
+    """Embed the local California interactive HTML map when it is available."""
+    st.subheader("California Interactive Redistricting Map")
+    html_path = BASE_DIR / "mapca_plan1_interactive.html"
+
+    if not html_path.exists():
+        st.error("California map file not found: mapca_plan1_interactive.html")
+        return
+
+    try:
+        html_content = html_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        st.error(f"California map file could not be read: {exc}")
+        return
+
+    components.html(html_content, height=800, scrolling=True)
+
+
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
     """Draw the requested top-10 bar charts."""
     detected = detect_columns(gdf.drop(columns="geometry", errors="ignore"))
@@ -4598,6 +4617,8 @@ def main() -> None:
         display_redistricting_metrics(active_gdf)
         display_state_comparison()
         display_proposed_plan_mode(active_gdf, state_name, simplify)
+        if state_name == "California":
+            display_california_interactive_redistricting_map()
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
