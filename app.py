@@ -38,7 +38,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-27 plan-html-fairness-metrics"
+APP_VERSION = "2026-05-27 multi-state-plan-html"
 
 STATE_CONFIG = {
     "California": {
@@ -79,6 +79,19 @@ STATE_CONFIG = {
             ("Alexandria", 31.3113, -92.4451),
             ("Monroe", 32.5093, -92.1193),
         ],
+    },
+}
+
+INTERACTIVE_PLAN_CONFIG = {
+    "California": {
+        "title": "California Interactive Redistricting Map",
+        "filename": "mapca_plan1_interactive.html",
+        "preferred_layers": ("mapca_plan1_vote",),
+    },
+    "Louisiana": {
+        "title": "Louisiana Interactive Redistricting Map",
+        "filename": "LA proposed reock map.html",
+        "preferred_layers": ("la_results",),
     },
 }
 
@@ -4428,15 +4441,19 @@ def extract_tmap_widget_payload(html_content: str) -> dict[str, Any]:
     return json.loads(match.group(1))
 
 
-def find_tmap_plan_polygon_call(widget_payload: dict[str, Any]) -> dict[str, Any]:
-    """Find the addPolygons call that contains the California plan data."""
+def find_tmap_plan_polygon_call(
+    widget_payload: dict[str, Any],
+    preferred_layer_names: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Find the addPolygons call that contains exported plan metrics."""
     polygon_calls = [
         call
         for call in widget_payload.get("x", {}).get("calls", [])
         if call.get("method") == "addPolygons" and len(call.get("args", [])) >= 5
     ]
+    preferred_layers = set(preferred_layer_names)
     for call in polygon_calls:
-        if call["args"][2] == "mapca_plan1_vote":
+        if call["args"][2] in preferred_layers and isinstance(call["args"][4], list) and call["args"][4]:
             return call
     for call in polygon_calls:
         if isinstance(call["args"][4], list) and call["args"][4]:
@@ -4493,32 +4510,48 @@ def plan_population_metric(plan_df: pd.DataFrame) -> tuple[str, str]:
     )
 
 
-def build_california_plan_metric_tables(
+def build_interactive_plan_metric_tables(
     plan_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
-    """Build numeric fairness tables from the saved California interactive map data."""
+    """Build numeric fairness tables from a saved interactive tmap export."""
+    def plan_numeric(column: str) -> pd.Series:
+        fallback = pd.Series(np.nan, index=plan_df.index, dtype="float64")
+        return safe_numeric(plan_df[column] if column in plan_df.columns else fallback)
+
     district_count = len(plan_df)
-    signed_margin = safe_numeric(plan_df.get("margin_pct", pd.Series(dtype="float64")))
+    signed_margin = plan_numeric("margin_pct")
     winner_margin = signed_margin.abs().dropna()
-    total_dem = safe_numeric(plan_df.get("total_dem", pd.Series(dtype="float64"))).sum()
-    total_rep = safe_numeric(plan_df.get("total_rep", pd.Series(dtype="float64"))).sum()
+    total_dem_series = plan_numeric("total_dem")
+    total_rep_series = plan_numeric("total_rep")
+    total_votes_series = plan_numeric("total_votes")
+    if total_votes_series.notna().sum() == 0:
+        total_votes_series = total_dem_series + total_rep_series
+    total_dem = total_dem_series.sum()
+    total_rep = total_rep_series.sum()
     two_party_total = total_dem + total_rep
     democratic_seats = int((signed_margin > 0).sum())
     republican_seats = int((signed_margin < 0).sum())
 
-    compactness = safe_numeric(plan_df.get("compactness_polsby_popper", pd.Series(dtype="float64"))).dropna()
-    geometry_parts_count = safe_numeric(plan_df.get("geometry_part_count", pd.Series(dtype="float64"))).dropna()
+    compactness = plan_numeric("compactness_polsby_popper").dropna()
+    geometry_parts_count = plan_numeric("geometry_part_count").dropna()
     single_part_count = int((geometry_parts_count == 1).sum()) if not geometry_parts_count.empty else 0
     multipart_count = int((geometry_parts_count > 1).sum()) if not geometry_parts_count.empty else 0
 
-    white_vap = normalized_share(plan_df.get("pct_vap_white", pd.Series(dtype="float64")))
+    white_vap = normalized_share(plan_df["pct_vap_white"] if "pct_vap_white" in plan_df.columns else pd.Series(np.nan, index=plan_df.index))
     nonwhite_vap = (1 - white_vap).dropna()
     majority_minority_count = int((nonwhite_vap >= 0.50).sum()) if not nonwhite_vap.empty else 0
+    hba_labels = {
+        "pct_vap_hisp": "Hispanic",
+        "pct_vap_black": "Black",
+        "pct_vap_asian": "Asian",
+    }
+    hba_columns = [column for column in hba_labels if column in plan_df.columns]
     hba_vap = (
-        normalized_share(plan_df.get("pct_vap_hisp", pd.Series(dtype="float64")))
-        + normalized_share(plan_df.get("pct_vap_black", pd.Series(dtype="float64")))
-        + normalized_share(plan_df.get("pct_vap_asian", pd.Series(dtype="float64")))
-    ).dropna()
+        pd.concat([normalized_share(plan_df[column]) for column in hba_columns], axis=1).sum(axis=1, min_count=1).dropna()
+        if hba_columns
+        else pd.Series(dtype="float64")
+    )
+    hba_label = "+".join(hba_labels[column] for column in hba_columns) if hba_columns else "Hispanic+Black+Asian"
     hba_majority_count = int((hba_vap >= 0.50).sum()) if not hba_vap.empty else 0
 
     highly_competitive = int((winner_margin <= 0.01).sum()) if not winner_margin.empty else 0
@@ -4565,7 +4598,7 @@ def build_california_plan_metric_tables(
             {
                 "Metric": "Majority-Minority VAP",
                 "Value": f"{majority_minority_count}/{district_count} nonwhite VAP majority",
-                "Detail": f"{hba_majority_count}/{district_count} Hispanic+Black+Asian VAP majority; average nonwhite VAP {format_percent(nonwhite_vap.mean())}",
+                "Detail": f"{hba_majority_count}/{district_count} {hba_label} VAP majority; average nonwhite VAP {format_percent(nonwhite_vap.mean())}",
             },
             {
                 "Metric": "Compactness",
@@ -4580,15 +4613,15 @@ def build_california_plan_metric_tables(
         ]
     )
 
-    district_numbers = safe_numeric(plan_df.get("district", pd.Series(dtype="float64")))
+    district_numbers = plan_numeric("district")
     district_table = pd.DataFrame(
         {
             "District": district_numbers.map(lambda value: format_number(value)),
             "Winner": signed_margin.map(lambda value: "Not available" if pd.isna(value) else ("D" if value >= 0 else "R")),
             "Margin": signed_margin.map(format_party_margin),
-            "D Votes": safe_numeric(plan_df.get("total_dem", pd.Series(dtype="float64"))).map(format_number),
-            "R Votes": safe_numeric(plan_df.get("total_rep", pd.Series(dtype="float64"))).map(format_number),
-            "Total Votes": safe_numeric(plan_df.get("total_votes", pd.Series(dtype="float64"))).map(format_number),
+            "D Votes": total_dem_series.map(format_number),
+            "R Votes": total_rep_series.map(format_number),
+            "Total Votes": total_votes_series.map(format_number),
             "Nonwhite VAP": nonwhite_vap.reindex(plan_df.index).map(format_percent),
             "Compactness": compactness.reindex(plan_df.index).map(format_decimal_score),
             "Margin Bin": plan_df.get("margin_bin", pd.Series("", index=plan_df.index)),
@@ -4607,14 +4640,15 @@ def build_california_plan_metric_tables(
 
 
 @st.cache_data(show_spinner=False)
-def load_california_interactive_plan_metrics(
+def load_interactive_plan_metrics(
     html_path_text: str,
     modified_ns: int,
+    preferred_layer_names: tuple[str, ...],
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
-    """Calculate fairness metrics from the embedded California tmap HTML file."""
+    """Calculate fairness metrics from an embedded tmap HTML file."""
     html_content = Path(html_path_text).read_text(encoding="utf-8")
     widget_payload = extract_tmap_widget_payload(html_content)
-    polygon_call = find_tmap_plan_polygon_call(widget_payload)
+    polygon_call = find_tmap_plan_polygon_call(widget_payload, preferred_layer_names)
     raw_geometries, ids, _, options, popups = polygon_call["args"][:5]
 
     records: list[dict[str, Any]] = []
@@ -4650,35 +4684,40 @@ def load_california_interactive_plan_metrics(
             .drop(columns="_district_sort")
         )
 
-    return build_california_plan_metric_tables(plan_df)
+    return build_interactive_plan_metric_tables(plan_df)
 
 
-def display_california_interactive_redistricting_map() -> None:
-    """Embed the local California interactive HTML map and calculate its plan metrics."""
-    st.subheader("California Interactive Redistricting Map")
-    html_path = BASE_DIR / "mapca_plan1_interactive.html"
+def display_interactive_redistricting_map(state_name: str) -> None:
+    """Embed the state's local interactive HTML map and calculate its plan metrics."""
+    config = INTERACTIVE_PLAN_CONFIG[state_name]
+    title = str(config["title"])
+    filename = str(config["filename"])
+    html_path = BASE_DIR / filename
+
+    st.subheader(title)
 
     if not html_path.exists():
-        st.error("California map file not found: mapca_plan1_interactive.html")
+        st.error(f"{state_name} map file not found: {filename}")
         return
 
     try:
         html_modified_ns = html_path.stat().st_mtime_ns
         html_content = html_path.read_text(encoding="utf-8")
     except OSError as exc:
-        st.error(f"California map file could not be read: {exc}")
+        st.error(f"{state_name} map file could not be read: {exc}")
         return
 
     components.html(html_content, height=800, scrolling=True)
 
     st.subheader("Fairness Metrics")
     try:
-        fairness_metrics, district_table, summary_cards = load_california_interactive_plan_metrics(
+        fairness_metrics, district_table, summary_cards = load_interactive_plan_metrics(
             str(html_path),
             html_modified_ns,
+            tuple(config["preferred_layers"]),
         )
     except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
-        st.error(f"California plan metrics could not be calculated from the HTML map: {exc}")
+        st.error(f"{state_name} plan metrics could not be calculated from the HTML map: {exc}")
         return
 
     metric_columns = st.columns(4)
@@ -4692,7 +4731,7 @@ def display_california_interactive_redistricting_map() -> None:
         st.dataframe(district_table, use_container_width=True, hide_index=True)
 
     st.caption(
-        "Calculated from mapca_plan1_interactive.html. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
+        f"Calculated from {filename}. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
     )
 
 
@@ -4949,8 +4988,8 @@ def main() -> None:
         display_redistricting_metrics(active_gdf)
         display_state_comparison()
         display_proposed_plan_mode(active_gdf, state_name, simplify)
-        if state_name == "California":
-            display_california_interactive_redistricting_map()
+        if state_name in INTERACTIVE_PLAN_CONFIG:
+            display_interactive_redistricting_map(state_name)
 
     st.subheader("Charts")
     display_charts(active_gdf, geography)
