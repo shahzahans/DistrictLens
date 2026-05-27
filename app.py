@@ -92,6 +92,7 @@ INTERACTIVE_PLAN_CONFIG = {
         "title": "Louisiana Interactive Redistricting Map",
         "filename": "LA proposed reock map.html",
         "preferred_layers": ("la_results",),
+        "metrics_filename": "deploy_data/LA_interactive_plan_metrics.json",
     },
 }
 
@@ -4687,6 +4688,31 @@ def load_interactive_plan_metrics(
     return build_interactive_plan_metric_tables(plan_df)
 
 
+@st.cache_data(show_spinner=False)
+def load_precomputed_interactive_plan_metrics(
+    metrics_path_text: str,
+    modified_ns: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str], str]:
+    """Load source-data fairness metrics prepared for a saved interactive map."""
+    payload = json.loads(Path(metrics_path_text).read_text(encoding="utf-8"))
+    records = payload.get("districts") if isinstance(payload, dict) else payload
+    if not isinstance(records, list) or not records:
+        raise ValueError("precomputed metrics file does not contain district records")
+
+    plan_df = pd.DataFrame(records)
+    required_columns = {"district", "total_dem", "total_rep", "total_pop", "total_vap"}
+    missing_columns = sorted(required_columns - set(plan_df.columns))
+    if missing_columns:
+        raise ValueError(f"precomputed metrics file is missing: {', '.join(missing_columns)}")
+
+    source_caption = ""
+    if isinstance(payload, dict):
+        source_caption = str(payload.get("caption") or payload.get("method") or "").strip()
+
+    fairness_metrics, district_table, summary_cards = build_interactive_plan_metric_tables(plan_df)
+    return fairness_metrics, district_table, summary_cards, source_caption
+
+
 def display_interactive_redistricting_map(state_name: str) -> None:
     """Embed the state's local interactive HTML map and calculate its plan metrics."""
     config = INTERACTIVE_PLAN_CONFIG[state_name]
@@ -4710,15 +4736,41 @@ def display_interactive_redistricting_map(state_name: str) -> None:
     components.html(html_content, height=800, scrolling=True)
 
     st.subheader("Fairness Metrics")
+    metrics_source_caption = ""
+    metrics_filename = config.get("metrics_filename")
+    metrics_path = BASE_DIR / str(metrics_filename) if metrics_filename else None
     try:
-        fairness_metrics, district_table, summary_cards = load_interactive_plan_metrics(
-            str(html_path),
-            html_modified_ns,
-            tuple(config["preferred_layers"]),
-        )
+        if metrics_path and metrics_path.exists():
+            fairness_metrics, district_table, summary_cards, metrics_source_caption = (
+                load_precomputed_interactive_plan_metrics(
+                    str(metrics_path),
+                    metrics_path.stat().st_mtime_ns,
+                )
+            )
+        else:
+            fairness_metrics, district_table, summary_cards = load_interactive_plan_metrics(
+                str(html_path),
+                html_modified_ns,
+                tuple(config["preferred_layers"]),
+            )
     except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
-        st.error(f"{state_name} plan metrics could not be calculated from the HTML map: {exc}")
-        return
+        if metrics_path and metrics_path.exists():
+            st.warning(
+                f"{state_name} source-data metrics could not be loaded from {metrics_filename}: {exc}. "
+                "Using the embedded HTML map metrics instead."
+            )
+            try:
+                fairness_metrics, district_table, summary_cards = load_interactive_plan_metrics(
+                    str(html_path),
+                    html_modified_ns,
+                    tuple(config["preferred_layers"]),
+                )
+            except (json.JSONDecodeError, OSError, TypeError, ValueError) as fallback_exc:
+                st.error(f"{state_name} plan metrics could not be calculated from the HTML map: {fallback_exc}")
+                return
+        else:
+            st.error(f"{state_name} plan metrics could not be calculated from the HTML map: {exc}")
+            return
 
     metric_columns = st.columns(4)
     metric_columns[0].metric("Plan Seats", summary_cards.get("seats", "Not available"))
@@ -4730,9 +4782,12 @@ def display_interactive_redistricting_map(state_name: str) -> None:
     with st.expander("District-Level Numbers From The Interactive Map"):
         st.dataframe(district_table, use_container_width=True, hide_index=True)
 
-    st.caption(
-        f"Calculated from {filename}. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
-    )
+    if metrics_source_caption:
+        st.caption(metrics_source_caption)
+    else:
+        st.caption(
+            f"Calculated from {filename}. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
+        )
 
 
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
