@@ -1,9 +1,9 @@
 {
   "source": "LA_redist_data.RData",
   "source_object": "join_vtd_pop2_filter",
-  "map": "LA proposed reock map.html",
-  "method": "VTD polygons from LA_redist_data.RData were intersected with the district polygons in LA proposed reock map.html; VTD counts were area-weighted and aggregated by district.",
-  "caption": "Calculated from LA_redist_data.RData source VTD population, VAP, vote, and geometry data, intersected with the Louisiana interactive map districts.",
+  "map": "Louisian_Proposed_plan.html",
+  "method": "VTD polygons from LA_redist_data.RData were intersected with the district polygons in Louisian_Proposed_plan.html; VTD counts were area-weighted and aggregated by district.",
+  "caption": "Calculated from LA_redist_data.RData source VTD population, VAP, vote, and geometry data, intersected with the Louisian_Proposed_plan.html districts.",
   "features_loaded": 3639,
   "features_covered": 3639,
   "districts": [

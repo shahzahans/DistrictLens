@@ -38,7 +38,7 @@ CACHE_DIR = OUTPUT_DIR / "cache"
 DEPLOY_DATA_DIR = BASE_DIR / "deploy_data"
 MAX_MAP_FEATURES = 5000
 MIN_HYPOTHETICAL_OVERLAP_SHARE = 0.0025
-APP_VERSION = "2026-05-27 multi-state-plan-html"
+APP_VERSION = "2026-06-03 final-proposed-plan-html"
 
 STATE_CONFIG = {
     "California": {
@@ -84,14 +84,23 @@ STATE_CONFIG = {
 
 INTERACTIVE_PLAN_CONFIG = {
     "California": {
-        "title": "California Interactive Redistricting Map",
-        "filename": "mapca_plan1_interactive.html",
+        "title": "Final California Proposed Plan",
+        "description": (
+            "Embedded proposed California congressional map with district-level "
+            "partisan margins and fairness metrics calculated from the exported plan data."
+        ),
+        "filename": "proposed_california_plan.html",
         "preferred_layers": ("mapca_plan1_vote",),
     },
     "Louisiana": {
-        "title": "Louisiana Interactive Redistricting Map",
-        "filename": "LA proposed reock map.html",
-        "preferred_layers": ("la_results",),
+        "title": "Final Louisiana Proposed Plan",
+        "description": (
+            "Embedded proposed Louisiana congressional map showing partisan lean by district. "
+            "The fairness metrics summarize population balance, partisan outcome, competitiveness, "
+            "majority-minority VAP, compactness, and contiguity for the final plan."
+        ),
+        "filename": "Louisian_Proposed_plan.html",
+        "preferred_layers": ("LA_redistricting", "la_results"),
         "metrics_filename": "deploy_data/LA_interactive_plan_metrics.json",
     },
 }
@@ -4721,6 +4730,9 @@ def display_interactive_redistricting_map(state_name: str) -> None:
     html_path = BASE_DIR / filename
 
     st.subheader(title)
+    description = str(config.get("description") or "").strip()
+    if description:
+        st.markdown(description)
 
     if not html_path.exists():
         st.error(f"{state_name} map file not found: {filename}")

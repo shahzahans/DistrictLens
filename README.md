@@ -60,6 +60,8 @@ Congressional district view includes a district scorecard for California and Lou
 
 Congressional district view also includes proposed plan mode. Draw a small boundary-adjustment area and the app automatically detects which district loses area and which neighboring district gains it; direct editable-boundary and draw/upload modes are also available. The app repairs edited boundary changes into a same-size proposed plan, checks for gaps/overlaps, and estimates vote share, turnout, CVAP demographics, compactness, and overlap with current districts. The plan summary compares estimated outcomes against the current plan, including seats, competitiveness, majority-minority CVAP districts, compactness, and turnout. Estimates are approximate because they are area-weighted from the current congressional district layer.
 
+The final embedded proposed-plan HTML maps are `proposed_california_plan.html` and `Louisian_Proposed_plan.html`. Congressional district view shows these maps inside the app with a short title and description, then displays the fairness metric table directly below each map.
+
 ## Redistricting Metrics
 
 Congressional district view includes redistricting metrics for compactness, district area, district perimeter, majority-minority CVAP status, and competitiveness. Compactness uses the Polsby-Popper score, where higher values are more compact. Competitive districts are those with a two-party winner margin of 10 percentage points or less.
