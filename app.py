@@ -93,9 +93,9 @@ INTERACTIVE_PLAN_CONFIG = {
         "preferred_layers": ("mapca_plan1_vote",),
     },
     "Louisiana": {
-        "title": "Proposed Redistricting for Louisiana with Partisan Lean",
+        "title": "Final Proposed Louisiana Plan",
         "description": (
-            "Embedded proposed Louisiana congressional map showing partisan lean by district. "
+            "This second map is the final proposed Louisiana congressional plan. It shows partisan lean by district. "
             "The fairness metrics summarize population balance, partisan outcome, competitiveness, "
             "majority-minority VAP, compactness, and contiguity for the final plan."
         ),
@@ -4739,11 +4739,6 @@ def display_interactive_redistricting_map(state_name: str) -> None:
     filename = str(config["filename"])
     html_path = BASE_DIR / filename
 
-    st.subheader(title)
-    description = str(config.get("description") or "").strip()
-    if description:
-        st.markdown(description)
-
     if not html_path.exists():
         st.error(f"{state_name} map file not found: {filename}")
         return
@@ -4768,6 +4763,11 @@ def display_interactive_redistricting_map(state_name: str) -> None:
             st.warning(f"Reference map file could not be read: {exc}")
             continue
         components.html(reference_content, height=800, scrolling=True)
+
+    st.subheader(title)
+    description = str(config.get("description") or "").strip()
+    if description:
+        st.markdown(description)
 
     try:
         html_modified_ns = html_path.stat().st_mtime_ns
