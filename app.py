@@ -93,7 +93,7 @@ INTERACTIVE_PLAN_CONFIG = {
         "preferred_layers": ("mapca_plan1_vote",),
     },
     "Louisiana": {
-        "title": "Final Louisiana Proposed Plan",
+        "title": "Proposed Redistricting for Louisiana with Partisan Lean",
         "description": (
             "Embedded proposed Louisiana congressional map showing partisan lean by district. "
             "The fairness metrics summarize population balance, partisan outcome, competitiveness, "
@@ -102,9 +102,9 @@ INTERACTIVE_PLAN_CONFIG = {
         "filename": "Louisian_Proposed_plan.html",
         "preferred_layers": ("LA_redistricting", "la_results"),
         "metrics_filename": "deploy_data/LA_interactive_plan_metrics.json",
-        "reference_maps": [
+        "reference_maps_before": [
             {
-                "title": "Louisiana Reference Interactive Map",
+                "title": "Proposed Redistricting for Louisiana with Partisan Lean",
                 "description": (
                     "Original Louisiana interactive map retained for comparison with the final "
                     "proposed plan."
@@ -4747,6 +4747,27 @@ def display_interactive_redistricting_map(state_name: str) -> None:
     if not html_path.exists():
         st.error(f"{state_name} map file not found: {filename}")
         return
+
+    for reference_map in config.get("reference_maps_before", []):
+        reference_title = str(reference_map.get("title") or "Reference Map")
+        reference_description = str(reference_map.get("description") or "").strip()
+        reference_filename = str(reference_map.get("filename") or "").strip()
+        if not reference_filename:
+            continue
+
+        reference_path = BASE_DIR / reference_filename
+        st.subheader(reference_title)
+        if reference_description:
+            st.markdown(reference_description)
+        if not reference_path.exists():
+            st.warning(f"Reference map file not found: {reference_filename}")
+            continue
+        try:
+            reference_content = reference_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            st.warning(f"Reference map file could not be read: {exc}")
+            continue
+        components.html(reference_content, height=800, scrolling=True)
 
     try:
         html_modified_ns = html_path.stat().st_mtime_ns
