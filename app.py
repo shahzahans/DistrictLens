@@ -110,6 +110,7 @@ INTERACTIVE_PLAN_CONFIG = {
                     "proposed plan."
                 ),
                 "filename": "LA proposed reock map.html",
+                "metrics_title": "Fairness Metrics - Original Louisiana Map",
             },
         ],
     },
@@ -4732,6 +4733,30 @@ def load_precomputed_interactive_plan_metrics(
     return fairness_metrics, district_table, summary_cards, source_caption
 
 
+def display_interactive_plan_metric_results(
+    metric_title: str,
+    fairness_metrics: pd.DataFrame,
+    district_table: pd.DataFrame,
+    summary_cards: dict[str, str],
+    source_caption: str,
+    district_expander_label: str,
+) -> None:
+    """Show fairness metric cards, summary table, and district-level details."""
+    st.subheader(metric_title)
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Plan Seats", summary_cards.get("seats", "Not available"))
+    metric_columns[1].metric("Average Margin", summary_cards.get("avg_margin", "Not available"))
+    metric_columns[2].metric("0-1% Districts", summary_cards.get("competitive", "Not available"))
+    metric_columns[3].metric("Avg Compactness", summary_cards.get("compactness", "Not available"))
+    st.table(fairness_metrics)
+
+    with st.expander(district_expander_label):
+        st.dataframe(district_table, use_container_width=True, hide_index=True)
+
+    if source_caption:
+        st.caption(source_caption)
+
+
 def display_interactive_redistricting_map(state_name: str) -> None:
     """Embed the state's local interactive HTML map and calculate its plan metrics."""
     config = INTERACTIVE_PLAN_CONFIG[state_name]
@@ -4763,6 +4788,23 @@ def display_interactive_redistricting_map(state_name: str) -> None:
             st.warning(f"Reference map file could not be read: {exc}")
             continue
         components.html(reference_content, height=800, scrolling=True)
+        try:
+            fairness_metrics, district_table, summary_cards = load_interactive_plan_metrics(
+                str(reference_path),
+                reference_path.stat().st_mtime_ns,
+                tuple(reference_map.get("preferred_layers") or config["preferred_layers"]),
+            )
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            st.warning(f"Reference map fairness metrics could not be calculated: {exc}")
+            continue
+        display_interactive_plan_metric_results(
+            str(reference_map.get("metrics_title") or "Fairness Metrics - Reference Map"),
+            fairness_metrics,
+            district_table,
+            summary_cards,
+            f"Calculated from {reference_filename} embedded HTML map data.",
+            "District-Level Numbers From The Original Map",
+        )
 
     st.subheader(title)
     description = str(config.get("description") or "").strip()
@@ -4799,7 +4841,6 @@ def display_interactive_redistricting_map(state_name: str) -> None:
             continue
         components.html(reference_content, height=800, scrolling=True)
 
-    st.subheader("Fairness Metrics")
     metrics_source_caption = ""
     metrics_filename = config.get("metrics_filename")
     metrics_path = BASE_DIR / str(metrics_filename) if metrics_filename else None
@@ -4836,22 +4877,20 @@ def display_interactive_redistricting_map(state_name: str) -> None:
             st.error(f"{state_name} plan metrics could not be calculated from the HTML map: {exc}")
             return
 
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("Plan Seats", summary_cards.get("seats", "Not available"))
-    metric_columns[1].metric("Average Margin", summary_cards.get("avg_margin", "Not available"))
-    metric_columns[2].metric("0-1% Districts", summary_cards.get("competitive", "Not available"))
-    metric_columns[3].metric("Avg Compactness", summary_cards.get("compactness", "Not available"))
-    st.table(fairness_metrics)
-
-    with st.expander("District-Level Numbers From The Interactive Map"):
-        st.dataframe(district_table, use_container_width=True, hide_index=True)
-
     if metrics_source_caption:
-        st.caption(metrics_source_caption)
+        final_source_caption = metrics_source_caption
     else:
-        st.caption(
+        final_source_caption = (
             f"Calculated from {filename}. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
         )
+    display_interactive_plan_metric_results(
+        "Fairness Metrics - Final Proposed Plan",
+        fairness_metrics,
+        district_table,
+        summary_cards,
+        final_source_caption,
+        "District-Level Numbers From The Final Map",
+    )
 
 
 def display_charts(gdf: gpd.GeoDataFrame, geography: str) -> None:
