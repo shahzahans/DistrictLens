@@ -86,11 +86,22 @@ INTERACTIVE_PLAN_CONFIG = {
     "California": {
         "title": "Final California Proposed Plan",
         "description": (
-            "Embedded proposed California congressional map with district-level "
-            "partisan margins and fairness metrics calculated from the exported plan data."
+            "This map is the final proposed California congressional plan. It shows district-level "
+            "partisan margins, with fairness metrics calculated separately from this final map."
         ),
-        "filename": "proposed_california_plan.html",
+        "filename": "my_calimap.html",
         "preferred_layers": ("mapca_plan1_vote",),
+        "reference_maps_before": [
+            {
+                "title": "California Reference Proposed Plan",
+                "description": (
+                    "Original California interactive proposed map retained for comparison with "
+                    "the final California plan."
+                ),
+                "filename": "proposed_california_plan.html",
+                "metrics_title": "Fairness Metrics - Original California Map",
+            },
+        ],
     },
     "Louisiana": {
         "title": "Final Proposed Louisiana Plan",
