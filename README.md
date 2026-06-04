@@ -64,7 +64,7 @@ The final embedded proposed-plan HTML maps are `my_calimap.html` and `Louisian_P
 
 ## Redistricting Metrics
 
-Congressional district view includes redistricting metrics for compactness, district area, district perimeter, majority-minority CVAP status, and competitiveness. Compactness uses the Polsby-Popper score, where higher values are more compact. Competitive districts are those with a two-party winner margin of 10 percentage points or less.
+Congressional district view includes redistricting metrics for compactness, district area, district perimeter, majority-minority CVAP status, and competitiveness. Compactness uses the Polsby-Popper score, where higher values are more compact. The embedded proposed-plan metric cards report districts within a 0-5 percentage-point margin. The final proposed map compactness values use the final reported averages: 0.3978 for California and 0.4981 for Louisiana.
 
 ## CA vs LA Comparison
 

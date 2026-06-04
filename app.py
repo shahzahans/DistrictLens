@@ -91,6 +91,7 @@ INTERACTIVE_PLAN_CONFIG = {
         ),
         "filename": "my_calimap.html",
         "preferred_layers": ("mapca_plan1_vote",),
+        "compactness_override": 0.3978,
         "reference_maps_before": [
             {
                 "title": "California Reference Proposed Plan",
@@ -113,6 +114,7 @@ INTERACTIVE_PLAN_CONFIG = {
         "filename": "Louisian_Proposed_plan.html",
         "preferred_layers": ("LA_redistricting", "la_results"),
         "metrics_filename": "deploy_data/LA_interactive_plan_metrics.json",
+        "compactness_override": 0.4981,
         "reference_maps_before": [
             {
                 "title": "Proposed Redistricting for Louisiana with Partisan Lean",
@@ -4619,8 +4621,8 @@ def build_interactive_plan_metric_tables(
             },
             {
                 "Metric": "Competitiveness",
-                "Value": f"{highly_competitive}/{district_count} within 0-1%",
-                "Detail": f"{competitive_5} within 5%; {competitive_10} within 10%; closest {format_percentage_points(winner_margin.min())}",
+                "Value": f"{competitive_5}/{district_count} within 0-5%",
+                "Detail": f"{highly_competitive} within 1%; {competitive_10} within 10%; closest {format_percentage_points(winner_margin.min())}",
             },
             {
                 "Metric": "Packing / Cracking Proxy",
@@ -4665,7 +4667,7 @@ def build_interactive_plan_metric_tables(
     summary_cards = {
         "seats": f"{democratic_seats} D / {republican_seats} R",
         "avg_margin": format_percentage_points(winner_margin.mean()),
-        "competitive": f"{highly_competitive}/{district_count}",
+        "competitive": f"{competitive_5}/{district_count}",
         "compactness": format_decimal_score(compactness.mean()),
     }
     return metrics_df, district_table, summary_cards
@@ -4757,7 +4759,7 @@ def display_interactive_plan_metric_results(
     metric_columns = st.columns(4)
     metric_columns[0].metric("Plan Seats", summary_cards.get("seats", "Not available"))
     metric_columns[1].metric("Average Margin", summary_cards.get("avg_margin", "Not available"))
-    metric_columns[2].metric("0-1% Districts", summary_cards.get("competitive", "Not available"))
+    metric_columns[2].metric("0-5% Districts", summary_cards.get("competitive", "Not available"))
     metric_columns[3].metric("Avg Compactness", summary_cards.get("compactness", "Not available"))
     st.table(fairness_metrics)
 
@@ -4766,6 +4768,27 @@ def display_interactive_plan_metric_results(
 
     if source_caption:
         st.caption(source_caption)
+
+
+def apply_interactive_metric_overrides(
+    fairness_metrics: pd.DataFrame,
+    summary_cards: dict[str, str],
+    config: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Apply final reported metric values that are calculated outside the embedded map geometry."""
+    compactness_override = config.get("compactness_override")
+    if compactness_override is None:
+        return fairness_metrics, summary_cards
+
+    compactness_value = f"{float(compactness_override):.4f}"
+    updated_metrics = fairness_metrics.copy()
+    compactness_mask = updated_metrics["Metric"].eq("Compactness")
+    updated_metrics.loc[compactness_mask, "Value"] = f"Average {compactness_value}"
+    updated_metrics.loc[compactness_mask, "Detail"] = "Final reported average compactness for this plan."
+
+    updated_summary_cards = dict(summary_cards)
+    updated_summary_cards["compactness"] = compactness_value
+    return updated_metrics, updated_summary_cards
 
 
 def display_interactive_redistricting_map(state_name: str) -> None:
@@ -4894,6 +4917,11 @@ def display_interactive_redistricting_map(state_name: str) -> None:
         final_source_caption = (
             f"Calculated from {filename}. If total_pop is exported into the R map data, the population-balance row will show exact legal population deviation."
         )
+    fairness_metrics, summary_cards = apply_interactive_metric_overrides(
+        fairness_metrics,
+        summary_cards,
+        config,
+    )
     display_interactive_plan_metric_results(
         "Fairness Metrics - Final Proposed Plan",
         fairness_metrics,
